@@ -394,12 +394,12 @@ a:hover{text-decoration:underline}
     </div>
   </section>
 
-  <!-- 签到与福利中心（官方能力：仅国内版提供签到与福利活动） -->
+  <!-- 签到与福利中心（双区域：签到能力运行时探测，接口不存在的区域显示原因） -->
   <section id="sectionGrowthTasks" style="display:none">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
       <div>
         <h2 style="margin:0">签到与福利中心</h2>
-        <div style="font-size:12px;color:var(--dim)">全自动每日签到领取积分 (+100/天)，Pro 福利包一次性 +1800，连续签到与额度快照实时刷新</div>
+        <div style="font-size:12px;color:var(--dim)">全自动每日签到领取积分 (+100/天)，Pro 福利包一次性 +1800；限时活动（每日领取 100 Credits 等）在官方客户端内领取，此处呈现真实状态</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <select id="growthAcctSelect" onchange="switchGrowthAccount(this.value)" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--fg);font-family:inherit">
@@ -866,7 +866,7 @@ function updateUI(){
   }
 
   const btnCheckin = document.getElementById("btnCheckin");
-  if(btnCheckin) btnCheckin.style.display = (window.VIEW_REALM === "cn" ? "inline-block" : "none");  // 签到仅国内版
+  if(btnCheckin) btnCheckin.style.display = "inline-block";  // 双区域：能力运行时探测
 
   // 计算当前绑定与生效的 Key 数量
   const keys = (typeof API_KEY_ROWS !== 'undefined' && API_KEY_ROWS.length) ? API_KEY_ROWS : (window.API_KEY_ROWS || []);
@@ -1129,10 +1129,7 @@ async function switchGrowthAccount(uid){
 async function loadGrowthTasks(){
   const sec = document.getElementById("sectionGrowthTasks");
   if(!sec) return;
-  if(window.VIEW_REALM !== 'cn'){
-    sec.style.display = 'none';   // 官方：签到/福利活动仅国内版
-    return;
-  }
+  // 双区域都展示：签到能力由后端运行时探测，接口不存在时任务行会给出原因
   sec.style.display = 'block';
   try{
     const q = (CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all') ? ('?uid=' + encodeURIComponent(CURRENT_GROWTH_UID)) : '';
@@ -1147,7 +1144,7 @@ async function loadGrowthTasks(){
     const sel = document.getElementById("growthAcctSelect");
     if(sel && accts.length){
       const opts = ['<option value="all"' + (CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>全部账号 (批量)</option>']
-        .concat(accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(a.nickname) + ' (' + esc(a.uid.slice(0,6)) + ')</option>'))
+        .concat(accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(a.nickname) + ' (' + esc(a.uid.slice(0,6)) + ' · ' + (a.realm === 'intl' ? '国际版' : '国内版') + ')</option>'))
         .join('');
       sel.innerHTML = opts;
     }

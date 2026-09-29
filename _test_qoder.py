@@ -685,6 +685,98 @@ check("log_message silences favicon regardless of status (code present)",
           os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "qoder_proxy.py"), encoding="utf-8").read())
 
+print()
+print("[15] HTTP/1.1 SSE framing — keep-alive friendly (no more reconnect loop)")
+_src15 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("handler defines chunked SSE helpers",
+      all(k in _src15 for k in ("def _sse_begin", "def _sse_write",
+                                "def _sse_end")))
+check("_sse_begin sends Transfer-Encoding: chunked",
+      'self.send_header("Transfer-Encoding", "chunked")' in _src15)
+check("_sse_end writes terminating zero chunk",
+      'b"0\\r\\n\\r\\n"' in _src15)
+check("no 'Connection: close' on streaming responses (root cause of reconnect loop)",
+      'self.send_header("Connection", "close")' not in _src15)
+check("streaming writes go through _sse_write (chunk-encoded)",
+      "self.wfile.write(line)" not in _src15
+      and "self.wfile.write(clean_responses_frame(frame))" not in _src15)
+check("chunked streams are terminated on every exit path",
+      _src15.count("self._sse_end()") >= 4, _src15.count("self._sse_end()"))
+
+print()
+print("[16] liveness probe endpoints (GET /ping was 404 -> clients reconnect loop)")
+check("/ping served without auth/panel",
+      'if path in ("/ping", "/healthz", "/livez", "/readyz"):' in _src15)
+check("/ping returns plain pong", 'body = b"pong\\n"' in _src15)
+check("/ping sits before the /health handler (earliest match)",
+      _src15.find('if path in ("/ping"') < _src15.find('if path == "/health":'))
+
+print()
+print("[17] SSE heartbeat during long upstream silence (TTFT up to 71s observed)")
+check("sse_with_heartbeat helper exists",
+      "def sse_with_heartbeat(" in _src15)
+check("heartbeat emits SSE comment frames (': ping')",
+      'b": ping\\n\\n"' in _src15)
+check("heartbeat enabled by default with env override",
+      'os.environ.get("QD_SSE_HEARTBEAT"' in _src15)
+check("both streaming paths wrap their source with heartbeat",
+      _src15.count("sse_with_heartbeat(") >= 3,
+      _src15.count("sse_with_heartbeat("))
+
+# 行为级：数据透传 / 空闲补心跳 / 上游异常原样抛出 / 可关闭
+_sent2, _slow = [], []
+
+
+def _slow_gen():
+    time.sleep(0.4)                     # 模拟长首字延迟（上游静默）
+    yield b"data: late\n\n"
+    time.sleep(0.4)                     # 模拟帧间静默
+    yield b"data: late2\n\n"
+
+
+for item in P.sse_with_heartbeat(_slow_gen(), _sent2.append, interval=0.15,
+                                 idle_limit=10):
+    _slow.append(item)
+check("heartbeat: data passes through unchanged",
+      _slow == [b"data: late\n\n", b"data: late2\n\n"], _slow)
+check("heartbeat: comment frames sent during both silences",
+      len(_sent2) >= 2 and all(f == b": ping\n\n" for f in _sent2),
+      (len(_sent2), _sent2))
+
+
+class _BoomErr(RuntimeError):
+    pass
+
+
+def _boom_gen():
+    yield b"data: first\n\n"
+    raise _BoomErr("upstream died")
+
+
+_sent3, _got3, _raised3 = [], [], None
+try:
+    for item in P.sse_with_heartbeat(_boom_gen(), _sent3.append, interval=0.15,
+                                     idle_limit=5):
+        _got3.append(item)
+except Exception as exc:
+    _raised3 = exc
+check("heartbeat: upstream error propagates unchanged",
+      isinstance(_raised3, _BoomErr) and _got3 == [b"data: first\n\n"],
+      (type(_raised3).__name__, _got3))
+
+
+def _one_gen():
+    yield b"data: only\n\n"
+
+
+_sent4, _got4 = [], []
+for item in P.sse_with_heartbeat(_one_gen(), _sent4.append, interval=0,
+                                 idle_limit=5):
+    _got4.append(item)
+check("heartbeat: interval=0 disables (pure pass-through)",
+      _got4 == [b"data: only\n\n"] and _sent4 == [], (_got4, _sent4))
+
 # 行为：内容审核信封 -> 一次都不重开（open_upstream 不被再次调用）并上抛
 class _DiErrResp(object):
     def __iter__(self):
@@ -789,31 +881,56 @@ check("shared model follows current default realm",
       P.detect_model_realm("qmodel") == P.CURRENT_REALM)
 
 print()
-print("[5.6] official capability gating (check-in is CN-only)")
+print("[5.6] check-in capability is probed at runtime (not hard-coded per realm)")
 import qoder_accounts as _A
-check("cn has_checkin True", _A.get_realm_config("cn")["has_checkin"] is True)
-check("intl has_checkin False (official)", _A.get_realm_config("intl")["has_checkin"] is False)
+import urllib.error as _ue2, io as _io2
+check("cn has_checkin hint True", _A.get_realm_config("cn")["has_checkin"] is True)
+check("intl has_checkin hint False (still only a hint)",
+      _A.get_realm_config("intl")["has_checkin"] is False)
 acc_intl = _A.Account({"uid": "i1", "realm": "intl", "accessToken": "dt-x"})
 acc_cn = _A.Account({"uid": "c1", "realm": "cn", "accessToken": "dt-y"})
-check("intl account cannot checkin", acc_intl.can_checkin() is False)
+# 未探测前不按区域拒绝：国际版同样会真的去尝试一次（实测国际版接口 404，
+# 由探测结果决定后续跳过，而不是"看区域直接不做"）
+check("intl account is attempted before probing (realm is not a gate)",
+      acc_intl.can_checkin() is True and acc_intl.checkin_capability()[0] is None)
 check("cn account can checkin", acc_cn.can_checkin() is True)
+
+# 国际版形态：/daily-check-in/* 404 -> 能力记录为不可用 + 明确原因（不是静默）
+def fake_status_404(url, **kw):
+    raise _ue2.HTTPError(url, 404, "nf", {}, _io2.BytesIO(b'{"errorCode":"NotFound"}'))
+_orig_hj = _A.http_json
+_A.http_json = fake_status_404
 res_intl = acc_intl.checkin()
-check("intl checkin returns unavailable without network",
-      res_intl.get("ok") is False and "not available" in str(res_intl.get("error")))
+cap_intl, reason_intl = acc_intl.checkin_capability()
+_A.http_json = _orig_hj
+check("404 status -> (ok, unavailable) with explicit reason",
+      res_intl.get("ok") is True and res_intl.get("unavailable") is True
+      and res_intl.get("reason") == _A.CHECKIN_REASON_NOT_FOUND, res_intl)
+check("404 message names the missing endpoint + hand-off to official client",
+      "daily-check-in" in str(res_intl.get("msg"))
+      and "客户端" in str(res_intl.get("msg")), res_intl.get("msg"))
+check("capability cached as unavailable -> can_checkin False (no repeated 404s)",
+      cap_intl is False and acc_intl.can_checkin() is False and "404" in reason_intl)
+# TTL 到期后回到"未探测"，下一次调用会真的重探（活动上线即自动恢复）
+acc_intl._checkin_cap_at -= (_A.CHECKIN_PROBE_TTL + 1)
+check("TTL 过期 -> capability 回到 unknown，下一次触发重探",
+      acc_intl.checkin_capability()[0] is None and acc_intl.can_checkin() is True)
+
 # 官方活动停用 (DISABLED) -> 不 claim、按跳过成功处理
 def fake_status_disabled(url, **kw):
     return {"campaignKey": "cn_daily_check_in_legacy", "status": "DISABLED",
             "rewardCredits": 100, "currentStreakDays": 0, "totalClaimDays": 0,
             "totalRewardCredits": 0}
-_orig_hj = _A.http_json
 _A.http_json = fake_status_disabled
 acc_dis = _A.Account({"uid": "d1", "realm": "cn", "accessToken": "dt-x"})
 res_dis = acc_dis.checkin()
+cap_ok, _why = acc_dis.checkin_capability()
 _A.http_json = _orig_hj
 check("DISABLED campaign -> ok+disabled (no claim POST)",
       res_dis.get("ok") is True and res_dis.get("disabled") is True, res_dis)
+check("realm-capable status response marks capability available",
+      cap_ok is True, cap_ok)
 # pro eligibility 404 -> 查询成功但不可领取
-import urllib.error as _ue2, io as _io2
 def fake_pro_404(url, **kw):
     raise _ue2.HTTPError(url, 404, "nf", {}, _io2.BytesIO(b""))
 _A.http_json = fake_pro_404
@@ -821,6 +938,47 @@ ok_p, elig_p = acc_dis.pro_eligibility()
 _A.http_json = _orig_hj
 check("pro eligibility 404 -> (queried, not eligible)",
       ok_p is True and elig_p is False, (ok_p, elig_p))
+
+print()
+print("[5.7] campaign platform (/sash/api/v1/me/campaigns) — the new daily-claim home")
+_acc_camp = _A.Account({"uid": "cp1", "realm": "intl", "accessToken": "dt-x"})
+check("campaigns path constant present (same path on cn + intl)",
+      _A.PATH_CAMPAIGNS == "/sash/api/v1/me/campaigns")
+
+
+def fake_campaigns(url, **kw):
+    check("campaigns hit the openapi base of the account realm",
+          url.startswith(_A.get_realm_config("intl")["openapi"]), url)
+    return {"uid": "cp1", "showCampaign": True, "claimable": True,
+            "campaignUrl": "https://qoder.com/activities/daily-credits",
+            "campaigns": [{"campaignId": "c-1", "campaignKey": "client_launch_26",
+                           "startAt": 1789000000000, "endAt": 1789500000000,
+                           "placements": [{"type": "usage_panel"}]}]}
+
+
+_A.http_json = fake_campaigns
+camp = _acc_camp.campaigns()
+_A.http_json = _orig_hj
+check("campaigns normalized: show/claimable/url",
+      camp["ok"] and camp["show_campaign"] and camp["claimable"]
+      and camp["campaign_url"].endswith("/daily-credits"), camp)
+check("campaigns normalized: id/key/epoch(ms->s)/placements",
+      camp["campaigns"][0]["campaign_id"] == "c-1"
+      and camp["campaigns"][0]["campaign_key"] == "client_launch_26"
+      and camp["campaigns"][0]["start_at"] == 1789000000
+      and camp["campaigns"][0]["placements"], camp["campaigns"])
+check("campaign snapshot cached on the account", _acc_camp.campaign_status is camp)
+
+
+def fake_campaigns_404(url, **kw):
+    raise _ue2.HTTPError(url, 404, "nf", {}, _io2.BytesIO(b'{"errorCode":"NotFound"}'))
+
+
+_A.http_json = fake_campaigns_404
+camp404 = _acc_camp.campaigns()
+_A.http_json = _orig_hj
+check("campaigns 404 -> ok False + available False (no crash)",
+      camp404["ok"] is False and camp404["available"] is False, camp404)
 
 print()
 print("[6] request body construction")
@@ -889,6 +1047,69 @@ check("assistant tool_calls serialized into content",
       "Bash" in body3["messages"][2]["content"])
 check("tool result carried as user text",
       "file1" in body3["messages"][3]["content"])
+
+print()
+print("[6.5] DeepSeek reasoning_content backfill keys off the UPSTREAM model key")
+# 复现 issue #2 的根因：客户端按文档写「内部 key: dfmodel」时，旧实现只按
+# 名字前缀 "deepseek" 判断 -> 不做多轮 reasoning_content 兼容 -> 偶发失败。
+_ds_trace = [
+    {"role": "user", "content": "1+1=?"},
+    {"role": "assistant", "content": "2", "reasoning_content": "简单加法"},
+    {"role": "user", "content": "再+1"},
+]
+check("is_deepseek_model: upstream keys", 
+      P.is_deepseek_model("", "dfmodel") and P.is_deepseek_model("", "dmodel"))
+check("is_deepseek_model: client-visible names",
+      P.is_deepseek_model("DeepSeek-Flash") and P.is_deepseek_model("deepseek-v4-pro")
+      and P.is_deepseek_model("DeepSeek-V4-Pro"))
+check("is_deepseek_model: display id form",
+      P.is_deepseek_model("dfmodel (DeepSeek-Flash)"))
+check("is_deepseek_model: non-DeepSeek models stay untouched",
+      not P.is_deepseek_model("qmodel") and not P.is_deepseek_model("Qwen3.8-Max"))
+
+_bf_key = P.backfill_reasoning_content([dict(m) for m in _ds_trace], "dfmodel",
+                                       "dfmodel")
+check("client using key 'dfmodel' NOW gets the backfill (regression)",
+      all("reasoning_content" in m for m in _bf_key
+          if m.get("role") == "assistant"), _bf_key)
+_bf_name = P.backfill_reasoning_content([dict(m) for m in _ds_trace],
+                                        "DeepSeek-Flash", "dfmodel")
+check("display name path still works (no regression)",
+      any(m.get("reasoning_content") == "简单加法" for m in _bf_name))
+_bf_other = P.backfill_reasoning_content(
+    [{"role": "user", "content": "q"},
+     {"role": "assistant", "content": "a", "reasoning_content": "trace"}],
+    "qmodel", "qmodel")
+check("non-DeepSeek model: no reasoning_content added by the backfill",
+      _bf_other[1] == {"role": "assistant", "content": "a",
+                       "reasoning_content": "trace"})
+_st_other, _flat_other, _ = P.flatten_messages(_bf_other, keep_reasoning=False)
+check("flatten drops reasoning_content for non-DeepSeek upstreams",
+      all("reasoning_content" not in m for m in _flat_other), _flat_other)
+_st_ds, _flat_ds, _ = P.flatten_messages(
+    [{"role": "user", "content": "q"},
+     {"role": "assistant", "content": "a", "reasoning_content": "trace"}],
+    keep_reasoning=True)
+check("flatten KEEPS reasoning_content for DeepSeek upstreams (was dropped)",
+      _flat_ds[1].get("reasoning_content") == "trace", _flat_ds)
+_no_trace = P.backfill_reasoning_content(
+    [{"role": "user", "content": "hi"}], "dfmodel", "dfmodel")
+check("no reasoning trace in history -> no synthetic field",
+      all("reasoning_content" not in m for m in _no_trace))
+
+# 端到端：build_qoder_body 用显式 key 调用时也会补
+_body_ds = P.build_qoder_body({
+    "model": "dfmodel",
+    "messages": [
+        {"role": "user", "content": "1+1=?"},
+        {"role": "assistant", "content": "2", "reasoning_content": "简单加法"},
+        {"role": "user", "content": "再+1"},
+    ],
+}, None, "dfmodel", realm="cn")
+_ds_assistants = [m for m in _body_ds["messages"] if m.get("role") == "assistant"]
+check("build_qoder_body('dfmodel') backfills assistant history",
+      _ds_assistants and all("reasoning_content" in m for m in _ds_assistants),
+      _ds_assistants)
 
 print()
 print("[7] SSE envelope unwrapping & aggregation")
@@ -1192,7 +1413,69 @@ check("text parts joined", flat[0]["content"] == "part1")
 check("image collected", images == ["data:image/png;base64,AAA"])
 check("fingerprint string sanitized",
       "You are Claude Code, Anthropic's official CLI tool" in
-      P.sanitize_text("You are Claude Code, Anthropic's official CLI for Claude"))
+      P.sanitize_text("You are Claude Code, Anthropic's official CLI tool for Claude"))
+
+print()
+print("[18] task center lists every realm (issue #1: intl check-in was filtered out)")
+_t_intl = A.Account({"uid": "t-intl", "realm": "intl", "domain": "qoder.com",
+                     "accessToken": "dt-x", "nickname": "intl-user"})
+_t_cn = A.Account({"uid": "t-cn", "realm": "cn", "domain": "qoder.com.cn",
+                   "accessToken": "dt-y", "nickname": "cn-user"})
+_t_pool = A.AccountPool(os.path.join(os.environ["ACCOUNTS_DIR"], "unused"))
+_t_pool.accounts = [_t_intl, _t_cn]
+# 离线打桩：状态 404（intl 真实形态）+ 活动平台可用
+_orig_status = A.Account.checkin_status
+_orig_camp = A.Account.campaigns
+_orig_credits = A.Account.fetch_credits
+_orig_plan = A.Account.fetch_plan
+_orig_elig = A.Account.pro_eligibility
+
+
+def _stub_status(self):
+    if self.realm == "intl":
+        self._mark_checkin_capability(False, "%s (HTTP 404)"
+                                      % A.CHECKIN_REASON_NOT_FOUND)
+        return False, {"unavailable": True, "reason": A.CHECKIN_REASON_NOT_FOUND,
+                       "http": 404, "error": "HTTP 404 NotFound"}
+    return True, {"status": "DISABLED", "active": False, "today_checked_in": False,
+                  "streak_days": 0, "total_claim_days": 0, "reward_credits": 100,
+                  "total_reward_credits": 0, "next_claim_at": 0,
+                  "last_claimed_at": 0, "reward_expires_at": 0}
+
+
+A.Account.checkin_status = _stub_status
+A.Account.campaigns = lambda self: {
+    "ok": True, "available": True, "show_campaign": False, "claimable": False,
+    "campaign_url": "", "campaigns": []}
+A.Account.fetch_credits = lambda self: {"ok": True, "credits": {}}
+A.Account.fetch_plan = lambda self: ""
+A.Account.pro_eligibility = lambda self: (True, False)
+try:
+    _view_intl = T.fetch_tasks_view(_t_pool, uid="t-intl")
+    _view_cn = T.fetch_tasks_view(_t_pool, uid="t-cn")
+    _view_all = T.fetch_tasks_view(_t_pool)
+finally:
+    A.Account.checkin_status = _orig_status
+    A.Account.campaigns = _orig_camp
+    A.Account.fetch_credits = _orig_credits
+    A.Account.fetch_plan = _orig_plan
+    A.Account.pro_eligibility = _orig_elig
+
+check("intl account is selectable in the task center",
+      _view_intl.get("account", {}).get("uid") == "t-intl", _view_intl.get("msg"))
+check("task center lists BOTH realms",
+      {a["realm"] for a in _view_all["accounts"]} == {"cn", "intl"},
+      _view_all["accounts"])
+_codes = [t["task_code"] for t in _view_intl["tasks"]]
+check("intl check-in row explains the missing endpoint (not silent)",
+      "daily_checkin" in _codes
+      and "接口" in [t for t in _view_intl["tasks"]
+                     if t["task_code"] == "daily_checkin"][0]["description"],
+      _view_intl["tasks"][0])
+check("campaign platform row present with jump url",
+      any(t["task_code"] == "campaign_platform" for t in _view_intl["tasks"]))
+check("campaign state surfaced in summary",
+      "campaigns" in _view_intl["summary"])
 
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))

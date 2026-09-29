@@ -42,7 +42,10 @@ REALM_CONFIGS = {
         "redirect_uri": "qoder-work-cn://",
         "domain": "qoder.com.cn",
         "ua": "QoderWork/1.1.34",
-        "has_checkin": True,       # 官方：仅国内版有每日签到 (sash daily-check-in)
+        # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
+        # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
+        # 每日领取活动搬到 campaign 平台后，任何区域都可能新增/下线接口。
+        "has_checkin": True,
         "send_client_id": True,    # CN 设备授权 URL: client_id + machine_id + redirect_uri
         "send_redirect_uri": True,
         "nonce_dashed": True,      # CN nonce 使用带横线 uuid
@@ -58,7 +61,9 @@ REALM_CONFIGS = {
         "redirect_uri": "qoder://aicoding.aicoding-agent/login-success",
         "domain": "qoder.com",
         "ua": "Qoder/1.1.34",
-        "has_checkin": False,      # 官方：国际版无签到接口 (见 cpa docs/PROTOCOL.md)
+        # 国际版目前 /sash/api/v1/me/daily-check-in/* 返回 404（实测），但活动
+        # 页面同样挂着"每日领取 100 Credits"。该字段仅作提示，门控靠运行时探测。
+        "has_checkin": False,
         "send_client_id": True,    # Intl 设备授权 URL: client_id + machine_id (无 redirect_uri)
         "send_redirect_uri": False,
         "nonce_dashed": False,     # intl nonce 为 32-hex uuid-simple
@@ -83,6 +88,14 @@ PATH_CHECKIN_STATUS = "/sash/api/v1/me/daily-check-in/status"
 PATH_CHECKIN_CLAIM = "/sash/api/v1/me/daily-check-in/claim"
 PATH_PRO_ELIGIBILITY = "/sash/api/v1/me/pro-upgrade/eligibility"
 PATH_PRO_CLAIM = "/sash/api/v1/me/pro-upgrade/claim"
+# 官方新活动平台（双区域通用，实测 cn/intl 均 200）：服务端下发活动列表与
+# campaignUrl/JS，领取动作由桌面客户端承接；网关用它做状态呈现与提示。
+PATH_CAMPAIGNS = "/sash/api/v1/me/campaigns"
+
+# 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
+# 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
+CHECKIN_PROBE_TTL = 6 * 3600
+CHECKIN_REASON_NOT_FOUND = "checkin_endpoint_not_found"
 
 # 会话死亡标记：上游主动吊销离线会话，刷新已无意义，需要重新登录。
 SESSION_DEAD_MARKERS = ("TOKEN_EXPIRE", "12153", "Offline user session not found")
@@ -259,6 +272,13 @@ class Account(object):
         self.user_type = str(data.get("userType") or "") or DEFAULT_USER_TYPE
         self.organization_id = str(data.get("organizationId") or "")
         self.organization_name = str(data.get("organizationName") or "")
+        # 签到能力：None=未探测 / True=接口存在 / False=接口不存在（404）。
+        # 运行时探测而非按区域硬编码——官方随时可能在任一区域增删活动接口。
+        self._checkin_cap = None
+        self._checkin_cap_reason = ""
+        self._checkin_cap_at = 0.0
+        # 最近一次 campaign 平台状态快照（/sash/api/v1/me/campaigns）
+        self.campaign_status = None
 
     # -- 持久化 ------------------------------------------------------------
     def to_dict(self):
@@ -308,7 +328,12 @@ class Account(object):
             "credits": self.credits,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
-            "canCheckin": bool(get_realm_config(self.realm)["has_checkin"]),
+            # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
+            "canCheckin": self.can_checkin(),
+            "checkinCapability": ("unknown" if self.checkin_capability()[0] is None
+                                  else ("available" if self.checkin_capability()[0]
+                                        else "not_found")),
+            "checkinReason": self.checkin_capability()[1],
             "userType": self.user_type,
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
@@ -473,8 +498,28 @@ class Account(object):
         return True
 
     # -- 签到 / 额度 / 套餐 ------------------------------------------------
+    def _mark_checkin_capability(self, available, reason=""):
+        self._checkin_cap = bool(available)
+        self._checkin_cap_reason = reason or ""
+        self._checkin_cap_at = time.time()
+
+    def checkin_capability(self):
+        """签到能力（运行时探测结果）。
+
+        None  = 尚未探测（调用方应实际尝试一次）
+        True  = 本账号所在区域存在 /daily-check-in 接口
+        False = 接口不存在（404/405/410，实测国际版即如此）——缓存 TTL 内跳过
+        """
+        if self._checkin_cap is None:
+            return None, ""
+        if time.time() - self._checkin_cap_at > CHECKIN_PROBE_TTL:
+            return None, self._checkin_cap_reason
+        return self._checkin_cap, self._checkin_cap_reason
+
     def can_checkin(self):
-        if not get_realm_config(self.realm)["has_checkin"]:
+        """今日是否还需要签到（能力由运行时探测，不再按区域硬编码）。"""
+        capable, _ = self.checkin_capability()
+        if capable is False:
             return False
         if not self.last_checkin:
             return True
@@ -482,7 +527,11 @@ class Account(object):
         return not str(self.last_checkin).startswith(today_str)
 
     def checkin_status(self):
-        """GET daily-check-in/status -> (ok, summary|error)。"""
+        """GET daily-check-in/status -> (ok, summary|error)。
+
+        接口在本区域不存在时返回 (False, {"unavailable": True, reason:...})，
+        并记录能力探测结果（活动上线后 TTL 到期会自动重探）。
+        """
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_CHECKIN_STATUS
         try:
@@ -493,9 +542,20 @@ class Account(object):
                 body = exc.read().decode("utf-8", "replace")
             except Exception:
                 body = ""
-            return False, "HTTP %d %s" % (exc.code, body[:160])
+            if exc.code in (404, 405, 410):
+                self._mark_checkin_capability(
+                    False, "%s (HTTP %d)" % (CHECKIN_REASON_NOT_FOUND, exc.code))
+                return False, {
+                    "unavailable": True,
+                    "reason": CHECKIN_REASON_NOT_FOUND,
+                    "http": exc.code,
+                    "error": "HTTP %d %s" % (exc.code, body[:160]),
+                }
+            return False, {"unavailable": False,
+                           "error": "HTTP %d %s" % (exc.code, body[:160])}
         except Exception as exc:
-            return False, str(exc)
+            return False, {"unavailable": False, "error": str(exc)}
+        self._mark_checkin_capability(True, "")
         last = ""
         if q.get("lastClaimedAt"):
             try:
@@ -519,12 +579,20 @@ class Account(object):
         }
 
     def checkin(self):
-        """每日签到：先查状态，未签则领取。返回 {ok, msg, ...}。"""
-        if not get_realm_config(self.realm)["has_checkin"]:
-            return {"ok": False, "error": "checkin is not available for this realm"}
+        """每日签到：先查状态，未签则领取。返回 {ok, msg, ...}。
+
+        不再按区域门控：接口不存在（国际版 404）按"本区域无此接口"跳过并给
+        出明确原因，而不是静默什么都不做（历史问题：看板点签到毫无反应）。
+        """
         ok, st = self.checkin_status()
         if not ok:
-            return {"ok": False, "error": st}
+            if st.get("unavailable"):
+                return {"ok": True, "unavailable": True,
+                        "reason": st.get("reason"),
+                        "msg": "本区域未开放 /sash/api/v1/me/daily-check-in 接口"
+                               "（HTTP %s）：每日领取活动改由官方客户端承接"
+                               % st.get("http")}
+            return {"ok": False, "error": st.get("error") or str(st)}
         if st["today_checked_in"]:
             return {"ok": True, "already": True, "msg": "今日已签到",
                     "streak_days": st["streak_days"], "reward_credits": st["reward_credits"]}
@@ -564,6 +632,52 @@ class Account(object):
         self._stamp_checkin()
         return {"ok": True, "msg": "签到成功 +%d 积分" % reward,
                 "reward_credits": reward}
+
+    def campaigns(self):
+        """GET /sash/api/v1/me/campaigns -> 官方活动平台状态（双区域通用）。
+
+        官方把"每日领取 100 Credits"等限时活动搬到了 campaign 平台：列表里
+        的 campaignUrl / placements[].commands[].js 由服务端下发，领取动作在
+        桌面客户端内完成（网关不执行服务端下发的 JS，只做状态呈现）。
+        返回 {ok, available, show_campaign, claimable, campaign_url, campaigns}。
+        """
+        cfg = get_realm_config(self.realm)
+        url = cfg["openapi"] + PATH_CAMPAIGNS
+        try:
+            q = http_json(url, method="GET", headers=self.headers(), timeout=15,
+                          retries=1)
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            return {"ok": False, "available": exc.code not in (404, 405, 410),
+                    "error": "HTTP %d %s" % (exc.code, body[:160])}
+        except Exception as exc:
+            return {"ok": False, "available": True, "error": str(exc)}
+        items = []
+        raw = q.get("campaigns")
+        for c in (raw if isinstance(raw, list) else []):
+            if not isinstance(c, dict):
+                continue
+            placements = c.get("placements")
+            items.append({
+                "campaign_id": str(c.get("campaignId") or c.get("campaign_id") or ""),
+                "campaign_key": str(c.get("campaignKey") or c.get("campaign_key") or ""),
+                "start_at": normalize_epoch(c.get("startAt") or c.get("start_at")),
+                "end_at": normalize_epoch(c.get("endAt") or c.get("end_at")),
+                "placements": placements if isinstance(placements, list) else [],
+            })
+        st = {
+            "ok": True,
+            "available": True,
+            "show_campaign": bool(q.get("showCampaign")),
+            "claimable": bool(q.get("claimable")),
+            "campaign_url": str(q.get("campaignUrl") or ""),
+            "campaigns": items,
+        }
+        self.campaign_status = st
+        return st
 
     def _stamp_checkin(self):
         self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")

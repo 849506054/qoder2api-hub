@@ -139,11 +139,9 @@ class Scheduler(object):
                 self.log(line)
 
         # 2. 每日签到：整点签到窗口内执行；其余巡检只补签未签账号
-        #    （官方能力：签到仅国内版 has_checkin=True）
-        from qoder_accounts import get_realm_config
+        #    （能力运行时探测：接口不存在的区域由 run_checkin 给出原因并跳过）
         targets = [a for a in self.pool.accounts
-                   if a.enabled and a.access_token
-                   and get_realm_config(a.realm)["has_checkin"]]
+                   if a.enabled and a.access_token]
         pending = targets if checkin_due else [a for a in targets if a.can_checkin()]
         checkin_count = 0
         earned = 0

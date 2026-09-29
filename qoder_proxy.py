@@ -215,6 +215,10 @@ except Exception:
 
 NOISE_KEYS = ("extra_fields", "refusal", "reasoning_content")
 
+# DeepSeek 上游 model key（官方目录：dmodel=DeepSeek-V4-Pro / dfmodel=DeepSeek-Flash）。
+# 这族模型的多轮一致性与 reasoning_content 强相关，见 is_deepseek_model。
+DEEPSEEK_MODEL_KEYS = ("dmodel", "dfmodel")
+
 
 class BodyTooLarge(Exception):
     """Raised when a request body exceeds the configured cap."""
@@ -1879,9 +1883,33 @@ def sanitize_messages(messages):
     return out
 
 
-def backfill_reasoning_content(messages, model):
-    """DeepSeek 多轮一致性：assistant 历史补 reasoning_content。"""
-    if not model or not str(model).lower().startswith("deepseek"):
+def is_deepseek_model(model="", model_key=""):
+    """判断这次请求最终打到的是不是一个 DeepSeek 上游模型。
+
+    必须同时看**上游 key**（dmodel / dfmodel）和客户端写的名字：
+    客户端完全可能直接写 `dfmodel`/`dmodel`（仓库文档里就把 DeepSeek-Flash
+    标为「内部 key：dfmodel」），而展示名是 `DeepSeek-Flash`。此前只按名字
+    前缀 "deepseek" 判断，走 key 的请求拿不到 reasoning_content 兼容处理，
+    多轮会话会被上游拒绝——表现为"偶发失败、重试有时能过"。
+    """
+    key = str(model_key or "").strip().lower()
+    if key in DEEPSEEK_MODEL_KEYS:
+        return True
+    low = str(model or "").strip().lower()
+    if not low:
+        return False
+    if low in DEEPSEEK_MODEL_KEYS or low.startswith("deepseek"):
+        return True
+    # 展示 id「dfmodel (DeepSeek-Flash)」/ 别名 deepseek-v4-flash 等
+    return "deepseek" in low
+
+
+def backfill_reasoning_content(messages, model, model_key=""):
+    """DeepSeek 多轮一致性：assistant 历史补 reasoning_content。
+
+    触发条件只看"上游是不是 DeepSeek"，与客户端用 key 还是展示名无关。
+    """
+    if not is_deepseek_model(model, model_key):
         return messages
     has_trace = False
     for m in messages:
@@ -2042,7 +2070,7 @@ def _flatten_content_text(content):
     return "\n".join(t for t in texts if t), images
 
 
-def flatten_messages(messages):
+def flatten_messages(messages, keep_reasoning=False):
     """把客户端会话压平成 Qoder 上游可接受的 {role, content} 序列。
 
     返回 (system_text, flat_msgs, images)：
@@ -2050,6 +2078,10 @@ def flatten_messages(messages):
       - user/assistant 原位保留（content 压平为字符串）
       - tool 结果降级为 user 消息（上游不认识 tool 角色）
       - assistant 的 tool_calls 序列化进 content，保证上下文不丢
+      - assistant 的 reasoning_content 仅在 keep_reasoning=True（DeepSeek 族）
+        时保留：这族模型的多轮一致性与该字段绑定，其它模型不带（避免上游
+        因未知字段拒答）。此前 flatten 无条件丢弃该字段，使
+        backfill_reasoning_content 的兼容处理在真实请求路径上完全失效。
     """
     system_text = None
     flat, images = [], []
@@ -2081,10 +2113,17 @@ def flatten_messages(messages):
             if calls:
                 text = (text or "") + "\n\n[assistant 请求调用工具]\n" + \
                     json.dumps(calls, ensure_ascii=False)
-            flat.append({"role": "assistant", "content": text or ""})
+            item = {"role": "assistant", "content": text or ""}
+            if keep_reasoning and m.get("reasoning_content") is not None:
+                item["reasoning_content"] = m.get("reasoning_content") or ""
+            flat.append(item)
             continue
         if role in ("user", "assistant"):
-            flat.append({"role": role, "content": text or ""})
+            item = {"role": role, "content": text or ""}
+            if role == "assistant" and keep_reasoning \
+                    and m.get("reasoning_content") is not None:
+                item["reasoning_content"] = m.get("reasoning_content") or ""
+            flat.append(item)
         elif role:  # 未知角色一律降级为 user，不静默丢弃
             flat.append({"role": "user", "content": text or ""})
     return system_text, flat, images
@@ -2102,9 +2141,10 @@ def build_qoder_body(payload, account, model_key, realm=None):
     messages = normalize_roles(payload.get("messages") or [])
     messages = sanitize_messages(messages)
     model = payload.get("model") or ""
-    messages = backfill_reasoning_content(messages, model)
+    messages = backfill_reasoning_content(messages, model, model_key)
 
-    system_text, flat, images = flatten_messages(messages)
+    system_text, flat, images = flatten_messages(
+        messages, keep_reasoning=is_deepseek_model(model, model_key))
     # 模板只保留 system 基座（其自带的示例 user 轮次是样例内容，必须丢弃），
     # 真实会话随后追加。
     tmpl_system = [m for m in (body.get("messages") or [])
@@ -2697,6 +2737,72 @@ def open_upstream(payload, session_key=None, target_realm=None):
     raise RuntimeError(
         "no usable account for realm '%s': all are disabled, cooling down, or expired"
         % realm)
+
+
+def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
+    """在等待上游数据的空档里发送 SSE 注释心跳（`: ping`），并原样转发数据。
+
+    背景：`xhigh` 长上下文请求的上游首字延迟可达 40–71 秒（实测日志），
+    这段时间网关对客户端一言不发；客户端/中间代理一旦空闲超时就会断开并
+    重连（表现为“一直重连”）。SSE 规范允许以 `:` 开头的注释行，客户端会
+    忽略，因此用它做保活。
+
+    source     : 上游数据迭代器（iter_inner_sse 的输出，产出 bytes）
+    send       : 发送函数（接收 bytes）
+    interval   : 空闲多久发一次心跳（秒），默认 5（可用 QD_SSE_HEARTBEAT 覆盖）
+    idle_limit : 单次等待上限（秒），默认 900；超过抛 TimeoutError
+
+    读线程把上游数据放入队列，主线程只在“队列空闲”时补心跳，保证顺序与
+    错误传播（上游异常原样在主线程抛出）。
+    """
+    if interval is None:
+        try:
+            interval = float(os.environ.get("QD_SSE_HEARTBEAT", "5") or 5)
+        except Exception:
+            interval = 5.0
+    if interval <= 0:
+        # 显式关闭心跳：退化为直通
+        for item in source:
+            yield item
+        return
+    if idle_limit is None:
+        idle_limit = 900.0
+
+    import queue as _queue
+    import threading as _threading
+
+    box = _queue.Queue()
+    done = object()
+
+    def _reader():
+        try:
+            for item in source:
+                box.put(item)
+        except BaseException as exc:          # 上游错误/断连也要送主线程
+            box.put(exc)
+        finally:
+            box.put(done)
+
+    reader = _threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    waited = 0.0
+    while True:
+        try:
+            item = box.get(timeout=interval)
+        except _queue.Empty:
+            send(b": ping\n\n")               # SSE 注释：客户端忽略
+            waited += interval
+            if waited >= idle_limit:
+                raise TimeoutError(
+                    "upstream produced no data for %.0fs" % waited)
+            continue
+        if item is done:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        waited = 0.0
+        yield item
 
 
 def iter_inner_sse(resp, holder=None):
@@ -3706,6 +3812,48 @@ class Handler(BaseHTTPRequestHandler):
             pass
         log(fmt % args)
 
+    def _sse_begin(self):
+        """开始一个 HTTP/1.1 SSE 流：用 chunked 编码，保持连接可复用。
+
+        之前用 `Connection: close` + 裸写字节：客户端（连接池型 harness）
+        会把该连接视为可复用，下一次请求落在已半关闭的连接上，表现为
+        “一直重连 / 连不上”。改为 chunked 后，流结束发 0 长度的终止块，
+        连接保持 keep-alive，可安全复用。
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self._chunked = True
+
+    def _sse_write(self, data):
+        """按 chunked 编码写一段数据（data: bytes）。"""
+        if not data:
+            return
+        if not getattr(self, "_chunked", False):
+            # 理论上不会发生；保守回退成裸写
+            self.wfile.write(data)
+            self.wfile.flush()
+            return
+        self.wfile.write(("%x\r\n" % len(data)).encode("ascii"))
+        self.wfile.write(data)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def _sse_end(self):
+        """结束 chunked 流（写 0 长度终止块），连接保持可复用。"""
+        if not getattr(self, "_chunked", False):
+            return
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+        self._chunked = False
+
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -3893,6 +4041,19 @@ class Handler(BaseHTTPRequestHandler):
             }
             info["api_key_set"] = bool(API_KEY)
             return self._json(200, info)
+        if path in ("/ping", "/healthz", "/livez", "/readyz"):
+            # 极简探活端点：**不需要面板密码/API Key、不查账号池**。
+            # 客户端/守护脚本常用 GET /ping 判活，之前返回 404 会被判成
+            # “网关不可用” → 反复重连。这里返回纯文本 pong。
+            body = b"pong\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if cors_origin_allowed(self.path):
+                self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return self.wfile.write(body)
         if path == "/health":
             rep = current_account()
             info = {
@@ -4309,11 +4470,12 @@ class Handler(BaseHTTPRequestHandler):
                                             "msg": "未找到指定的账号"})
                 targets = [target]
             else:
+                # 不再按区域过滤：签到能力运行时探测，接口不存在的账号会在
+                # 日志里给出明确原因（历史问题：国际版点签到完全没反应）。
                 targets = [a for a in POOL.accounts
-                           if a.enabled
-                           and get_realm_config(a.realm)["has_checkin"]]
+                           if a.enabled and a.access_token]
             if not targets:
-                return self._json(200, {"ok": False, "msg": "未找到可签到的账号（签到仅国内版开放）"})
+                return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_checkin(targets, gap=1.0)
             return self._json(200, {
                 "ok": res["ok"],
@@ -4335,10 +4497,9 @@ class Handler(BaseHTTPRequestHandler):
                 targets = [target]
             else:
                 targets = [a for a in POOL.accounts
-                           if a.enabled
-                           and get_realm_config(a.realm)["has_checkin"]]
+                           if a.enabled and a.access_token]
             if not targets:
-                return self._json(200, {"ok": False, "msg": "未找到可领取的账号（活动仅国内版开放）"})
+                return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_pro_claim(targets)
             return self._json(200, {
                 "ok": True,
@@ -4374,8 +4535,9 @@ class Handler(BaseHTTPRequestHandler):
             for account in targets:
                 if account is None:
                     continue
-                if not get_realm_config(account.realm)["has_checkin"]:
-                    continue      # 官方：仅国内版有签到
+                if not account.enabled or not account.access_token:
+                    continue
+                # 能力运行时探测（不再"仅国内版"）：接口不存在时返回明确原因
                 res = account.checkin()
                 results.append({"uid": account.uid,
                                 "nickname": account.nickname, **res})
@@ -4635,14 +4797,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(502, "upstream unreachable: %s" % exc)
         with upstream:
             if want_stream:
-                self.send_response(200)
-                self.send_header("Content-Type",
-                                 "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                if cors_origin_allowed(self.path):
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
+                self._sse_begin()
                 first_ms = None
                 # 流内信封重试：上游可能 HTTP200 建流后在信封里投 418
                 # （access log 记 200 + 业务错 418 即此形态）。只要还没向
@@ -4663,12 +4818,13 @@ class Handler(BaseHTTPRequestHandler):
                                     yield item
 
                             inner = _count_src(
-                                iter_inner_sse(cur, holder=holder))
+                                sse_with_heartbeat(
+                                    iter_inner_sse(cur, holder=holder),
+                                    self._sse_write))
                             for frame in stream_responses_events(inner, model, holder):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
-                                self.wfile.write(clean_responses_frame(frame))
-                                self.wfile.flush()
+                                self._sse_write(clean_responses_frame(frame))
                             break
                         except (BrokenPipeError, ConnectionResetError,
                                 ConnectionAbortedError):
@@ -4723,7 +4879,9 @@ class Handler(BaseHTTPRequestHandler):
                     log("responses upstream status %s: %s"
                         % (pump_exc.status, msg[:200]), level="ERROR",
                         tag="chat")
+                    self._sse_end()
                     return
+                self._sse_end()
                 wall = int((time.time() - t_start) * 1000)
                 record_usage(model, holder.get("usage"), stream=True,
                              elapsed_ms=wall, ttft_ms=first_ms,
@@ -4841,14 +4999,7 @@ class Handler(BaseHTTPRequestHandler):
         with upstream:
             holder = {"usage": None}
             if want_stream:
-                self.send_response(200)
-                self.send_header("Content-Type",
-                                 "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                if cors_origin_allowed(self.path):
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
+                self._sse_begin()
                 emitted = False
                 first_ms = None
                 # 流内信封重试（同上：200 建流后信封投 418 的形态），仅在
@@ -4859,12 +5010,13 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     while True:
                         try:
-                            for line in iter_inner_sse(cur, holder=holder):
+                            for line in sse_with_heartbeat(
+                                    iter_inner_sse(cur, holder=holder),
+                                    self._sse_write):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)
                                 emitted = True
-                                self.wfile.write(line)
-                                self.wfile.flush()
+                                self._sse_write(line)
                             break
                         except (BrokenPipeError, ConnectionResetError,
                                 ConnectionAbortedError):
@@ -4919,19 +5071,19 @@ class Handler(BaseHTTPRequestHandler):
                         "message": msg, "type": etype,
                         "code": exc.status}}, ensure_ascii=False)
                     try:
-                        self.wfile.write(("data: %s\n\n" % err).encode("utf-8"))
-                        self.wfile.write(b"data: [DONE]\n\n")
-                        self.wfile.flush()
+                        self._sse_write(("data: %s\n\n" % err).encode("utf-8"))
+                        self._sse_write(b"data: [DONE]\n\n")
                     except Exception:
                         pass
+                    self._sse_end()
                     return
                 if not emitted:
                     err = json.dumps({"error": {
                         "message": "empty upstream stream",
                         "type": "server_error"}})
-                    self.wfile.write(("data: %s\n\n" % err).encode("utf-8"))
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                    self._sse_write(("data: %s\n\n" % err).encode("utf-8"))
+                self._sse_write(b"data: [DONE]\n\n")
+                self._sse_end()
                 wall = int((time.time() - t_start) * 1000)
                 record_usage(model, holder.get("usage"), stream=True,
                              elapsed_ms=wall, ttft_ms=first_ms,
