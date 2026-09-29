@@ -1,7 +1,8 @@
 """qoder_fingerprint.py —— 统一设备指纹稳定派生模块 (derive_id)
 
 无论是国内版 (qoder.com.cn / gateway.qoder.com.cn) 还是国际版
-(qoder.com / api3.qoder.sh)，均通过本模块基于账号 UID 和加盐哈希单向派生
+(qoder.com / api1.qoder.sh，官方候选 api1→api2→api3)，均通过本模块基于账号
+UID 和加盐哈希单向派生
 固定的伪物理设备特征 (machineId / sessionId)，确保每个账号长期来自同一台
 虚拟物理设备，且多账号之间天然隔离，阻断跨账号关联风控。
 
@@ -57,11 +58,11 @@ def get_desktop_fingerprint(uid: str, nickname: str = "", os_name: str = "win32"
         "commit": "5f9692923c93033111c51ad7b003eb80204a9b75",
         "ideName": "Qoder",
         "ideType": "Qoder",
-        "ideVersion": "1.1.34",
+        "ideVersion": "1.1.64",
         "machineId": derive_id(uid, "machine"),
         "sessionId": derive_id(uid, "session"),
         "extName": "qoder-desktop",
-        "extVersion": "1.1.34",
+        "extVersion": "1.1.64",
         "os": os_name,
         "arch": "x64",
         "osVersion": "10.0.26220",

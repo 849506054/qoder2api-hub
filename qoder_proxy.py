@@ -48,7 +48,7 @@ import qoder_catalog
 import qoder_settings
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
-from qoder_accounts import get_realm_config, CLIENT_UA
+from qoder_accounts import get_realm_config, gateway_candidates, CLIENT_UA
 from pathlib import Path
 
 VERSION = "1.0.0"
@@ -1402,27 +1402,33 @@ def read_dynamic_models(realm=None):
 
     注意：签名的 body 是 qoder_encode("{}")，请求必须**带同款 body**发出
     （服务端校验签名与 body 一致，裸 GET 会 403）。
+
+    主机按官方的候选顺序尝试（国际版 api1 → api2 → api3）：切换主机不影响
+    签名（签名只覆盖 path），单个域名故障不再导致模型清单整体拉取失败。
     """
     r = realm or CURRENT_REALM
     account = POOL.pick(realm=r) if POOL else None
     if account is None:
         return []
-    cfg = get_realm_config(r)
-    raw_url = cfg["gateway"] + MODELS_PATH
     # 签名以 qoder_encode("{}") 作为 body 参与 MD5；请求同样携带该 body。
     sign_body = qoder_encode(b"{}")
-    try:
-        sess = SESSIONS.get(account)
-        headers = sess.headers(sign_body, raw_url, model_key="", sse=False,
-                               accept="application/json")
-        headers["User-Agent"] = CLIENT_UA
-        url = validate_public_http_url(raw_url)
-        req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
-                                     method="GET", headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:
-        log("model discovery failed: %s" % exc)
+    payload = None
+    for host in gateway_candidates(r):
+        raw_url = host + MODELS_PATH
+        try:
+            sess = SESSIONS.get(account)
+            headers = sess.headers(sign_body, raw_url, model_key="", sse=False,
+                                   accept="application/json")
+            headers["User-Agent"] = CLIENT_UA
+            url = validate_public_http_url(raw_url)
+            req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
+                                         method="GET", headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            break
+        except Exception as exc:
+            log("model discovery failed on %s: %s" % (host, exc))
+    if payload is None:
         return []
     chat = payload.get("chat") or []
     out = []
@@ -1630,7 +1636,6 @@ def model_entry(mid, meta):
     promo = meta.get("promotion") if isinstance(meta.get("promotion"), dict) else {}
     if price_now is not None:
         item["price_factor"] = price_now
-        item["price_factor_valley"] = price_now
     peak = None
     if promo.get("before_promotion_price_factor") is not None:
         peak = promo.get("before_promotion_price_factor")
@@ -1638,12 +1643,30 @@ def model_entry(mid, meta):
         peak = meta.get("original_price_factor")
     if peak is not None:
         item["price_factor_peak"] = peak
-    if promo.get("active"):
+    # 低谷价 = 峰值 × 折扣（官方 promotion 的定义，与快照抓取时刻无关）。
+    # 旧实现直接把"当前 price_factor"当成低谷价：快照若在非低谷时段抓取，
+    # 报出的低谷价就会等于峰价（看板/客户端据此算错费用）。
+    discount = promo.get("discount_factor")
+    valley = None
+    try:
+        if peak is not None and discount and 0 < float(discount) <= 1:
+            valley = round(float(peak) * float(discount), 4)
+    except (TypeError, ValueError):
+        valley = None
+    if valley is None and price_now is not None:
+        valley = price_now
+    if valley is not None:
+        item["price_factor_valley"] = valley
+    # 只要官方给了 promotion 就下发峰谷元数据（不限于"此刻正在打折"）：
+    # 高峰期抓取的快照里 promo.active=False，旧实现会整块跳过，客户端于是
+    # 既看不到低谷窗口、也看不到峰价。active 如实透传官方值，"现在是否处于
+    # 低谷"另由 off_peak_active_now（按本地时间复算）给出。
+    if promo:
         badge = promo.get("badge") or {}
         desc_p = promo.get("description") or {}
         link = promo.get("link_url") or {}
         item["off_peak"] = {
-            "active": True,
+            "active": bool(promo.get("active")),
             "window_start": promo.get("window_start"),
             "window_end": promo.get("window_end"),
             "timezone": promo.get("timezone"),
@@ -2590,8 +2613,11 @@ def open_upstream(payload, session_key=None, target_realm=None):
             qoder_sign.DEFAULT_USER_TYPE
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
-        cfg = get_realm_config(account.realm)
-        raw_url = cfg["gateway"] + CHAT_PATH
+        # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
+        # 签名只覆盖 path，换主机不影响签名有效性。
+        hosts = gateway_candidates(account.realm)
+        host_i = 0
+        raw_url = hosts[host_i] + CHAT_PATH
 
         # ---- 发起请求（瞬时上游故障同账号快速重试） ----
         resp = None
@@ -2638,17 +2664,27 @@ def open_upstream(payload, session_key=None, target_realm=None):
             except Exception as exc:
                 last_exc = exc
                 detail = ""
-                # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试
+                # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试；
+                # 若还有官方备用推理域名，优先换域名（对整域故障更有效）。
                 if _is_transient_transport(exc) \
                         and tries < TRANSIENT_MAX_RETRIES:
-                    backoff = tries + 1      # 1s, 2s
-                    log("transient transport error on '%s' model '%s' "
-                        "(try %d/%d): %s - retry in %ds"
-                        % (account.uid[:8], model, tries + 1,
-                           TRANSIENT_MAX_RETRIES + 1,
-                           str(exc)[:120], backoff),
-                        level="WARN", tag="chat")
-                    time.sleep(backoff)
+                    if host_i + 1 < len(hosts):
+                        host_i += 1
+                        raw_url = hosts[host_i] + CHAT_PATH
+                        log("transient transport error on '%s' model '%s' "
+                            "(try %d/%d): %s - switching gateway host to %s"
+                            % (account.uid[:8], model, tries + 1,
+                               TRANSIENT_MAX_RETRIES + 1, str(exc)[:120],
+                               hosts[host_i]),
+                            level="WARN", tag="chat")
+                    else:
+                        log("transient transport error on '%s' model '%s' "
+                            "(try %d/%d): %s - retry in %ds"
+                            % (account.uid[:8], model, tries + 1,
+                               TRANSIENT_MAX_RETRIES + 1,
+                               str(exc)[:120], tries + 1),
+                            level="WARN", tag="chat")
+                    time.sleep(tries + 1)
                     continue
                 break
 

@@ -499,7 +499,10 @@ def rsa_pkcs1v15_encrypt(plain: bytes, n: int = None, e: int = None) -> bytes:
 # ---------------------------------------------------------------------------
 # COSY 会话与签名
 # ---------------------------------------------------------------------------
-COSY_VERSION = "0.1.43"
+# COSY 协议版本：官方 0.4.3 客户端（qoder-agent-sdk / qoder-cn-agent-sdk）
+# 内置常量为 "1.1.64"（SDK 里 `s5="1.1.64"`，cosy-version 头与 payload 共用），
+# 旧值 "0.1.43" 来自更早的 CLI 版本。实测 1.1.64 可用于模型列表与推理。
+COSY_VERSION = "1.1.64"
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 _IDENTITY_KEYS = (

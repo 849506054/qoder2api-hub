@@ -41,7 +41,7 @@ REALM_CONFIGS = {
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
         "domain": "qoder.com.cn",
-        "ua": "QoderWork/1.1.34",
+        "ua": "QoderWork/1.1.64",
         # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
         # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
         # 每日领取活动搬到 campaign 平台后，任何区域都可能新增/下线接口。
@@ -55,12 +55,15 @@ REALM_CONFIGS = {
     "intl": {
         "name": "国际版 (Global)",
         "openapi": "https://openapi.qoder.sh",
-        "gateway": "https://api3.qoder.sh",
+        # 推理主机取自 0.4.3 客户端的 endpoint 缓存/内置候选（api1 主选，
+        # api2/api3 为官方故障切换域名）：api1 连不上时按顺序切换。
+        "gateway": "https://api1.qoder.sh",
+        "gateway_fallbacks": ("https://api2.qoder.sh", "https://api3.qoder.sh"),
         "website": "https://qoder.com",
         "client_id": "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
         "redirect_uri": "qoder://aicoding.aicoding-agent/login-success",
         "domain": "qoder.com",
-        "ua": "Qoder/1.1.34",
+        "ua": "Qoder/1.1.64",
         # 国际版目前 /sash/api/v1/me/daily-check-in/* 返回 404（实测），但活动
         # 页面同样挂着"每日领取 100 Credits"。该字段仅作提示，门控靠运行时探测。
         "has_checkin": False,
@@ -108,6 +111,19 @@ def session_dead(msg):
 
 def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["cn"]
+
+
+def gateway_candidates(realm):
+    """该区域的推理主机候选列表（官方客户端同款：主选 + 故障切换域名）。
+
+    签名只覆盖 path，因此同一请求换主机后签名依旧有效。
+    """
+    cfg = get_realm_config(realm)
+    out = [cfg["gateway"]]
+    for host in cfg.get("gateway_fallbacks") or ():
+        if host and host not in out:
+            out.append(host)
+    return out
 
 
 def detect_realm_from_domain(domain):

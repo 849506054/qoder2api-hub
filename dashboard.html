@@ -266,7 +266,7 @@ a:hover{text-decoration:underline}
           <span id="tabIntlViewBadge" class="badge s mini" style="display:inline-block">当前视图</span>
         </div>
       </div>
-      <div class="mono" style="font-size:11px;color:var(--dim);margin-bottom:8px">qoder.com · api3.qoder.sh</div>
+      <div class="mono" style="font-size:11px;color:var(--dim);margin-bottom:8px">qoder.com · api1.qoder.sh</div>
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:8px">
         <div style="display:flex;align-items:baseline;gap:6px">
           <span id="tabIntlCredits" style="font-size:22px;font-weight:700;color:var(--accent2);letter-spacing:-.5px">0</span>
@@ -851,7 +851,7 @@ function updateUI(){
     gwName.style.color = isIntlGw ? "var(--accent)" : "#dc2626";
   }
   const ep = document.getElementById("activeEndpoint");
-  if(ep) ep.textContent = isIntlGw ? "https://api3.qoder.sh" : "https://gateway.qoder.com.cn";
+  if(ep) ep.textContent = isIntlGw ? "https://api1.qoder.sh" : "https://gateway.qoder.com.cn";
 
   const btnToggle = document.getElementById("btnToggleRealm");
   if(btnToggle) {

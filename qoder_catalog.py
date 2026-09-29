@@ -6,6 +6,10 @@
 取 chat 场景、**逐字段原样保留**（含 promotion 峰谷价、context_config 多窗口、
 thinking_config 思考档位、is_free/is_new/icon、strategies 等）。
 
+快照存放：运行时优先读取同目录的 qoder_catalog_intl.json / qoder_catalog_cn.json
+（客户端更新后用 `python _refresh_catalog.py` 一条命令重新导出，会打印差异摘要）；
+两个文件缺失时才回退到本文件中内嵌的**冻结副本**（并打印 WARNING）。
+
 条目字段（官方原样）：
   key                 上游模型 key（缩写 id）
   display_name        官方模型名（主流名，如 Qwen3.8-Max / GLM-5.2）
@@ -23,8 +27,10 @@ thinking_config 思考档位、is_free/is_new/icon、strategies 等）。
 """
 
 import json
+import os
 
-# 国际版 (qoder.com / api3.qoder.sh) 官方 chat 场景全字段快照
+# 国际版 (qoder.com / api1.qoder.sh) 官方 chat 场景全字段快照（冻结回退副本；
+# 运行时优先读取同目录 qoder_catalog_intl.json / qoder_catalog_cn.json）
 _INTL_JSON = r'''
 [
   {
@@ -1470,8 +1476,34 @@ _CN_JSON = r'''
 ]
 '''
 
-STATIC_INTL_MODELS = json.loads(_INTL_JSON)
-STATIC_CN_MODELS = json.loads(_CN_JSON)
+def _load_snapshot(filename, embedded):
+    """加载区域目录快照：优先同目录 JSON 文件，缺失才回退内嵌冻结副本。
+
+    外部文件由 `_refresh_catalog.py` 从本机官方客户端目录缓存重新导出（客户端
+    更新后重跑一次即可），格式与内嵌副本完全一致（chat 场景逐字段原样）。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list) and data:
+            return data
+    except Exception:
+        pass
+    _warn("catalog snapshot %s missing/unreadable - falling back to the frozen "
+          "built-in snapshot (may be outdated; run _refresh_catalog.py)" % filename)
+    return json.loads(embedded)
+
+
+def _warn(msg):
+    try:
+        print("[qoder-catalog] WARNING: %s" % msg)
+    except Exception:
+        pass
+
+
+STATIC_INTL_MODELS = _load_snapshot("qoder_catalog_intl.json", _INTL_JSON)
+STATIC_CN_MODELS = _load_snapshot("qoder_catalog_cn.json", _CN_JSON)
 STATIC_MODELS = STATIC_CN_MODELS   # 兼容旧名
 
 # 区域独占模型（官方双区清单差集）

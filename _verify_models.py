@@ -13,7 +13,8 @@
     A. id == 官方 display_name（客户端唯一要填的值）
     B. enabled == 官方 enable
     C. 峰谷价 == 官方 promotion（peak=before_promotion_price_factor，
-       valley=price_factor，window_start/end、badge 文案）
+       valley=peak×discount_factor，price_factor=快照时刻的官方当前价，
+       window_start/end、badge 文案、active 透传）
     D. 上下文窗口 == 官方 context_config（标签集合 + 默认窗口）
     E. 思考档位 == 官方 thinking_config（efforts 集合 + 默认档）
     F. description == 官方动态文案 zh.detail
@@ -193,7 +194,7 @@ def main():
                   f"gw={e.get('enabled')} off={om.get('enable')}")
             # C. 峰谷价
             promo = om.get("promotion") or {}
-            if promo.get("active"):
+            if promo:
                 peak_official = promo.get("before_promotion_price_factor")
                 check(realm, key, "price_factor_peak == official before_promotion",
                       e.get("price_factor_peak") == peak_official,
@@ -207,14 +208,25 @@ def main():
                 check(realm, key, "off_peak badge (zh) matches official",
                       op.get("badge") == (promo.get("badge") or {}).get("zh"),
                       f"gw={op.get('badge')!r} off={(promo.get('badge') or {}).get('zh')!r}")
+                check(realm, key, "off_peak.active == official promotion.active",
+                      bool(op.get("active")) == bool(promo.get("active")),
+                      f"gw={op.get('active')} off={promo.get('active')}")
                 # I. 低谷即时判定
                 expect_now = window_now(promo)
                 check(realm, key, "off_peak_active_now == independent recomputation",
                       e.get("off_peak_active_now") == bool(expect_now),
                       f"gw={e.get('off_peak_active_now')} recompute={expect_now}")
-            check(realm, key, "valley == official price_factor",
-                  e.get("price_factor_valley") == om.get("price_factor"),
-                  f"gw={e.get('price_factor_valley')} off={om.get('price_factor')}")
+            # 官方 price_factor 是"快照抓取时刻"的价格；低谷价 = 峰价 × 折扣
+            check(realm, key, "price_factor == official price_factor",
+                  e.get("price_factor") == om.get("price_factor"),
+                  f"gw={e.get('price_factor')} off={om.get('price_factor')}")
+            if promo and promo.get("before_promotion_price_factor") is not None \
+                    and promo.get("discount_factor"):
+                want_valley = round(float(promo["before_promotion_price_factor"])
+                                    * float(promo["discount_factor"]), 4)
+                check(realm, key, "valley == peak x discount (official rule)",
+                      e.get("price_factor_valley") == want_valley,
+                      f"gw={e.get('price_factor_valley')} off={want_valley}")
             # D. 上下文窗口
             ccfg = om.get("context_config") or {}
             if ccfg:

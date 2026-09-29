@@ -117,7 +117,7 @@ payload = json.loads(_b64.b64decode(payload_b64))
 check("payload keys sorted-compact",
       sorted(payload.keys()) == ["cosyVersion", "ideVersion", "info",
                                  "requestId", "version"])
-check("payload cosyVersion", payload["cosyVersion"] == "0.1.43")
+check("payload cosyVersion", payload["cosyVersion"] == S.COSY_VERSION)
 
 print()
 print("[5] model alias resolution (official keys)")
@@ -181,12 +181,21 @@ check("intl exclusive entry retains full fields",
       sorted(entry_i.keys()))
 cn38 = next(m for m in C.STATIC_CN_MODELS if m["key"] == "qmodel_38max")
 promo = cn38.get("promotion") or {}
-check("cn qmodel_38max has ACTIVE off-peak promotion", promo.get("active") is True)
+# 注意：promo.active / price_factor 是**快照抓取时刻**的官方值（低谷时段抓的
+# 快照 active=True 且 price=峰价×折扣；高峰时段抓的 active=False 且 price=峰价）。
+# 断言官方不变量，而不是断言"抓取时正好在打折"，否则测试随抓取时刻漂移。
+check("cn qmodel_38max carries off-peak promotion metadata",
+      bool(promo) and promo.get("rule_id") == "idle_time_model_credit_discount"
+      and isinstance(promo.get("active"), bool), promo.get("rule_id"))
 check("off-peak window = 22:00-08:00",
       promo.get("window_start") == "22:00" and promo.get("window_end") == "08:00")
 check("peak factor (before_promotion) = 0.5", promo.get("before_promotion_price_factor") == 0.5,
       promo.get("before_promotion_price_factor"))
-check("valley factor (current price_factor) = 0.2", cn38.get("price_factor") == 0.2)
+check("current price_factor is peak or valley (0.5 / 0.2)",
+      cn38.get("price_factor") in (0.5, 0.2), cn38.get("price_factor"))
+check("price_factor matches promo.active (peak when inactive)",
+      (cn38.get("price_factor") == 0.2) is bool(promo.get("active")),
+      (cn38.get("price_factor"), promo.get("active")))
 check("discount_factor = 0.4 (4折)", promo.get("discount_factor") == 0.4)
 check("promotion badge/description localized",
       bool((promo.get("badge") or {}).get("en")) and bool((promo.get("description") or {}).get("en")))
@@ -316,8 +325,10 @@ print()
 print("[5.9] ALL off-peak (低谷) promotion models — must be complete, not just one")
 PROMO_KEYS = {"qmodel_38max", "qmodel_latest", "qmodel"}
 for realm_name in ("cn", "intl"):
+    # 促销集合按"是否带官方 promotion 元数据"判定；promo.active 是快照抓取
+    # 时刻是否处于低谷时段（22:00-08:00），不该作为集合成员条件。
     promo_models = {m["key"] for m in C.models_for_realm(realm_name)
-                    if (m.get("promotion") or {}).get("active")}
+                    if m.get("promotion")}
     check(f"[{realm_name}] official promo set == the 3 off-peak models",
           promo_models == PROMO_KEYS, sorted(promo_models))
     # 每个促销模型都要产出完整 off_peak 输出（不止一个）
@@ -863,7 +874,7 @@ check("intl dmodel ctx = official 1000000", ctx_i.get("dmodel") == 1000000,
       ctx_i.get("dmodel"))
 pf = {m["key"]: m.get("price_factor") for m in C.STATIC_CN_MODELS}
 check("price_factor carried from official catalog",
-      pf.get("qfmodel") == 0.0 and pf.get("dmodel") == 0.8, pf.get("qfmodel"))
+      pf.get("qfmodel") == 0.0 and pf.get("dmodel") == 0.5, pf.get("dmodel"))
 check("exclusive sets derived from catalogs",
       "gm51model" in C.CN_EXCLUSIVE and "smodel" in C.INTL_EXCLUSIVE)
 check("exclusive realm detection: gm51model -> cn",
@@ -1476,6 +1487,68 @@ check("campaign platform row present with jump url",
       any(t["task_code"] == "campaign_platform" for t in _view_intl["tasks"]))
 check("campaign state surfaced in summary",
       "campaigns" in _view_intl["summary"])
+
+print()
+print("[19] gateway host failover (official intl api1 -> api2; CN single host)")
+check("gateway_candidates: intl primary is api1 with api2/api3 fallbacks",
+      A.gateway_candidates("intl") == ["https://api1.qoder.sh",
+                                       "https://api2.qoder.sh",
+                                       "https://api3.qoder.sh"],
+      A.gateway_candidates("intl"))
+check("gateway_candidates: cn has a single official host",
+      A.gateway_candidates("cn") == ["https://gateway.qoder.com.cn"],
+      A.gateway_candidates("cn"))
+
+# 行为：api1 传输层失败 -> 自动切到 api2 并在同一请求内成功
+import ssl as _ssl19
+_orig_urlopen19 = P.urllib.request.urlopen
+_hits19 = []
+
+
+class _Resp19(object):
+    status = 200
+
+    def read(self):
+        return b""
+
+    def close(self):
+        pass
+
+
+def _fake_urlopen19(req, timeout=None):
+    _hits19.append(req.full_url)
+    if "api1.qoder.sh" in req.full_url:
+        raise _ssl19.SSLError("simulated TLS EOF on primary host")
+    return _Resp19()
+
+
+_orig_pool19 = P.POOL
+_pool19 = A.AccountPool(os.path.join(os.environ["ACCOUNTS_DIR"], "unused19"))
+_pool19.accounts = [A.Account({"uid": "h19", "realm": "intl",
+                               "domain": "qoder.com",
+                               "accessToken": "dt-x"})]
+P.POOL = _pool19
+P.urllib.request.urlopen = _fake_urlopen19
+try:
+    _resp19, _acc19, _ = P.open_upstream(
+        {"model": "qmodel", "stream": True,
+         "messages": [{"role": "user", "content": "hi"}]},
+        target_realm="intl")
+    _err19 = None
+except Exception as exc:                      # pragma: no cover - failure path
+    _err19 = exc
+finally:
+    P.urllib.request.urlopen = _orig_urlopen19
+    P.POOL = _orig_pool19
+
+check("failover: request succeeded after primary host transport error",
+      _err19 is None and _acc19.uid == "h19", _err19)
+check("failover: both hosts were tried in order (api1 then api2)",
+      len(_hits19) == 2 and "api1.qoder.sh" in _hits19[0]
+      and "api2.qoder.sh" in _hits19[1], _hits19)
+check("failover: signature path unchanged across hosts",
+      _hits19[0].split("?")[0].endswith(P.CHAT_PATH.split("?")[0]),
+      _hits19[0])
 
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
