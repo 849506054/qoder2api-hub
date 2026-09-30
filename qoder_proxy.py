@@ -51,7 +51,7 @@ from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import get_realm_config, gateway_candidates, CLIENT_UA
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1906,6 +1906,76 @@ def sanitize_messages(messages):
     return out
 
 
+# 思考档位的官方词表顺序（用于把客户端档位映射到模型支持档位）
+EFFORT_RANK = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4,
+               "xhigh": 5, "max": 6}
+_EFFORT_OFF = ("none", "off", "disabled", "disable", "false", "0", "no")
+
+
+def supported_efforts(meta):
+    """该模型官方支持的思考档位（取自目录 thinking_config.enabled.efforts）。
+
+    空列表表示该模型只有"开/关"没有档位（如 cn 的 qmodel）。
+    """
+    tc = (meta or {}).get("thinking_config") or {}
+    enabled = tc.get("enabled") if isinstance(tc.get("enabled"), dict) else {}
+    efforts = enabled.get("efforts") if isinstance(enabled.get("efforts"), dict) else {}
+    return [e for e in EFFORT_RANK if e in efforts]
+
+
+def default_effort(meta):
+    """该模型的默认思考档位（is_default 标注项），无则取支持表中间档。"""
+    tc = (meta or {}).get("thinking_config") or {}
+    enabled = tc.get("enabled") if isinstance(tc.get("enabled"), dict) else {}
+    efforts = enabled.get("efforts") if isinstance(enabled.get("efforts"), dict) else {}
+    for e, cfg in efforts.items():
+        if isinstance(cfg, dict) and cfg.get("is_default"):
+            return e
+    sup = supported_efforts(meta)
+    return sup[len(sup) // 2] if sup else ""
+
+
+def normalize_reasoning_effort(effort, meta):
+    """把请求里的思考档位归一化到该模型**官方支持**的档位集合。
+
+    为什么必须做：上游对不支持的档位**不报错、直接忽略**（回落到模型默认档）。
+    实测：dfmodel 官方只支持 low/high/max（默认 max），传 medium/xhigh 时输出
+    与默认档一致——客户端以为"思考档位没生效"；cn 的 qmodel 只有开/关，传任何
+    档位都被忽略（只有 none 能关掉思考）。
+
+    规则：
+      - 关闭类取值（none/off/disabled/...）统一映射为 "none"（官方通用关闭值）；
+      - 模型有档位表：命中则原样透传；未命中取"最近的合法档位"（同距时偏向
+        模型默认档），并给出说明性 note；
+      - 模型无档位表（仅开/关）：除 none 外一律**不下发**该参数（避免给上游
+        发它不认识的档位）。
+
+    返回 (value|None, note)：value=None 表示不下发 reasoning_effort。
+    """
+    e = str(effort or "").strip().lower()
+    if not e:
+        return None, ""
+    if e in _EFFORT_OFF:
+        return "none", ""
+    sup = supported_efforts(meta)
+    if not sup:
+        return None, "dropped (model has no effort levels; use none to disable)"
+    if e in sup:
+        return e, ""
+    if e not in EFFORT_RANK:
+        return default_effort(meta) or sup[0], \
+            "unknown level -> %s" % (default_effort(meta) or sup[0])
+    d = default_effort(meta)
+    want = EFFORT_RANK[e]
+
+    def key(cand):
+        return (abs(EFFORT_RANK[cand] - want),
+                abs(EFFORT_RANK[cand] - EFFORT_RANK.get(d, want)))
+
+    best = sorted(sup, key=key)[0]
+    return best, "unsupported level %s -> %s" % (e, best)
+
+
 def is_deepseek_model(model="", model_key=""):
     """判断这次请求最终打到的是不是一个 DeepSeek 上游模型。
 
@@ -2252,8 +2322,17 @@ def build_qoder_body(payload, account, model_key, realm=None):
     effort = payload.get("reasoning_effort")
     if not effort and isinstance(payload.get("reasoning"), dict):
         effort = (payload.get("reasoning") or {}).get("effort")
+    if not effort and isinstance(payload.get("thinking"), dict):
+        # 兼容 thinking.effort / thinking_level 风格客户端
+        effort = (payload.get("thinking") or {}).get("effort") \
+            or (payload.get("thinking") or {}).get("level")
     if effort:
-        params["reasoning_effort"] = str(effort)
+        norm, note = normalize_reasoning_effort(effort, catalog_meta)
+        if note:
+            log("reasoning_effort %s on '%s' (supported=%s)"
+                % (note, model_key or model, supported_efforts(catalog_meta)), tag="chat")
+        if norm:
+            params["reasoning_effort"] = norm
     body["parameters"] = params
 
     # tools：客户端给了就用客户端的（custom freeform 已降级），否则置空，

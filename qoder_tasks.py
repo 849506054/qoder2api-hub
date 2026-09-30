@@ -49,101 +49,30 @@ def fetch_task_view(account):
         "campaigns": {"show": False, "claimable": False, "url": "", "items": []},
     }
 
-    # --- 每日签到（旧 sash 接口；不存在时给出明确原因而不是沉默） ---
+    # --- 每日签到：以官方活动平台为准（旧 sash 接口仅在仍然开放时附一行） ---
+    camp = account.campaigns()
+    tasks.append(_campaign_task_row(account, camp, summary))
     ok, st = account.checkin_status()
     if ok:
         summary["streak_days"] = st["streak_days"]
+    if ok and st.get("active"):
+        # 旧接口仍开放：附上历史签到状态（连续天数/累计天数）
         if st["today_checked_in"]:
-            status = "claimed"
-            current, target = 1, 1
-            desc = "今日已签到，明日再来（连续 %d 天，累计 %d 天）" % (
+            l_status, l_desc = "claimed", "今日已签到，明日再来（连续 %d 天，累计 %d 天）" % (
                 st["streak_days"], st["total_claim_days"])
-        elif st["active"]:
-            status = "completed"      # CLAIMABLE -> 待领奖
-            current, target = 1, 1
-            desc = "可领取 %d 积分（连续 %d 天，累计 %d 天）" % (
+        else:
+            l_status, l_desc = "completed", "可领取 %d 积分（连续 %d 天，累计 %d 天）" % (
                 st["reward_credits"] or 100, st["streak_days"],
                 st["total_claim_days"])
-        else:
-            status, current, target = "not_accepted", 0, 1
-            desc = "官方旧版签到活动当前未开放 (status=%s)" % (st.get("status") or "?")
         tasks.append({
-            "task_code": "daily_checkin",
-            "name": "每日签到",
-            "description": desc,
+            "task_code": "daily_checkin_legacy",
+            "name": "每日签到（旧活动批次）",
+            "description": l_desc,
             "jump_url": get_realm_config(account.realm)["website"] + "/",
-            "status": status,
-            "current": current,
-            "target": target,
+            "status": l_status,
+            "current": 1,
+            "target": 1,
             "reward_credit": st["reward_credits"] or 100,
-            "reward_energy": 0,
-        })
-    else:
-        unavailable = bool(st.get("unavailable"))
-        tasks.append({
-            "task_code": "daily_checkin",
-            "name": "每日签到",
-            "description": ("本区域未开放旧版签到接口（HTTP %s），"
-                            "活动改由官方客户端承接" % st.get("http"))
-                           if unavailable else
-                           ("签到状态查询失败: %s" % (st.get("error") or st)),
-            "jump_url": get_realm_config(account.realm)["website"] + "/activities",
-            "status": "not_accepted",
-            "current": 0,
-            "target": 1,
-            "reward_credit": 0,
-            "reward_energy": 0,
-        })
-
-    # --- 官方活动平台（新活动：每日领取 100 Credits 等） ---
-    camp = account.campaigns()
-    if camp.get("ok"):
-        items = [{"key": c["campaign_key"] or c["campaign_id"],
-                  "id": c["campaign_id"],
-                  "start_at": c["start_at"],
-                  "end_at": c["end_at"]} for c in camp.get("campaigns") or []]
-        summary["campaigns"] = {
-            "show": camp["show_campaign"],
-            "claimable": camp["claimable"],
-            "url": camp["campaign_url"],
-            "items": items,
-        }
-        url = camp["campaign_url"] or (
-            get_realm_config(account.realm)["website"] + "/activities")
-        if camp["claimable"]:
-            status, desc = "completed", (
-                "有可领取的活动权益：请点「立即体验」在官方客户端完成领取"
-                "（活动页面：%s）" % camp["campaign_url"])
-        elif camp["show_campaign"]:
-            status, desc = "not_accepted", "活动进行中，当前账号暂无可领取项"
-        elif items:
-            status, desc = "not_accepted", "官方活动登记 %d 项（%s）" % (
-                len(items), ", ".join(i["key"] for i in items if i["key"])[:80])
-        else:
-            status, desc = "not_accepted", "当前账号暂无官方限时活动"
-        tasks.append({
-            "task_code": "campaign_platform",
-            "name": "限时活动（每日领取 100 Credits 等）",
-            "description": desc,
-            "jump_url": url,
-            "status": status,
-            "current": 1 if camp["claimable"] else 0,
-            "target": 1,
-            "reward_credit": 100 if camp["claimable"] else 0,
-            "reward_energy": 0,
-        })
-    else:
-        tasks.append({
-            "task_code": "campaign_platform",
-            "name": "限时活动（每日领取 100 Credits 等）",
-            "description": ("活动平台接口在本区域不存在" if not camp.get("available")
-                            else "活动状态查询失败: %s"
-                            % (camp.get("error") or "?")),
-            "jump_url": get_realm_config(account.realm)["website"] + "/activities",
-            "status": "not_accepted",
-            "current": 0,
-            "target": 1,
-            "reward_credit": 0,
             "reward_energy": 0,
         })
 
@@ -194,6 +123,93 @@ def fetch_task_view(account):
     return tasks, summary
 
 
+def _campaign_task_row(account, camp, summary):
+    """把活动平台状态渲染成看板任务行（task_code=daily_checkin）。
+
+    状态语义：
+      CLAIMABLE + CLAIM_BENEFIT -> "completed"（待领奖，点「一键签到」即自动领取）
+      全部 CLAIMED              -> "claimed"  （今日已领取）
+      其它/无活动               -> "not_accepted"
+    """
+    website = get_realm_config(account.realm)["website"]
+    jump = (camp.get("campaign_url") or website + "/activities") \
+        if camp.get("ok") else website + "/activities"
+    items = [{"key": c["campaign_key"] or c["campaign_id"],
+              "id": c["campaign_id"],
+              "action_type": c.get("action_type", ""),
+              "claim_status": c.get("claim_status", ""),
+              "benefit_amount": (c.get("benefit") or {}).get("amount", 0),
+              "start_at": c["start_at"],
+              "end_at": c["end_at"]} for c in camp.get("campaigns") or []]
+    summary["campaigns"] = {
+        "show": bool(camp.get("show_campaign")),
+        "claimable": bool(camp.get("claimable")),
+        "url": camp.get("campaign_url") or "",
+        "items": items,
+    }
+    if not camp.get("ok"):
+        return {
+            "task_code": "daily_checkin",
+            "name": "每日签到（活动平台）",
+            "description": ("活动平台在本区域不可用" if not camp.get("available")
+                            else "活动状态查询失败: %s" % (camp.get("error") or "?")),
+            "jump_url": jump,
+            "status": "not_accepted",
+            "current": 0,
+            "target": 1,
+            "reward_credit": 0,
+            "reward_energy": 0,
+        }
+    claimable = [c for c in items
+                 if c["claim_status"] == "CLAIMABLE"
+                 and c["action_type"] in ("", "CLAIM_BENEFIT")]
+    claimed = [c for c in items if c["claim_status"] == "CLAIMED"]
+    if claimable:
+        amount = sum(c["benefit_amount"] or 0 for c in claimable)
+        keys = ", ".join(c["key"] for c in claimable)
+        return {
+            "task_code": "daily_checkin",
+            "name": "每日签到（每日领取 Credits）",
+            "description": "可领取 %s Credits（%s）—— 点「一键签到」自动领取"
+                           % (amount or "-", keys),
+            "jump_url": jump,
+            "status": "completed",
+            "current": 1,
+            "target": 1,
+            "reward_credit": amount,
+            "reward_energy": 0,
+        }
+    if claimed:
+        amount = sum(c["benefit_amount"] or 0 for c in claimed)
+        keys = ", ".join(c["key"] for c in claimed)
+        return {
+            "task_code": "daily_checkin",
+            "name": "每日签到（每日领取 Credits）",
+            "description": "今日已领取%s（%s），明日再来"
+                           % ((" +%s Credits" % amount) if amount else "", keys),
+            "jump_url": jump,
+            "status": "claimed",
+            "current": 1,
+            "target": 1,
+            "reward_credit": amount,
+            "reward_energy": 0,
+        }
+    desc = "当前账号暂无可参与的官方活动"
+    if camp.get("show_campaign"):
+        desc = "活动进行中，当前账号暂无可领取项"
+    return {
+        "task_code": "daily_checkin",
+        "name": "每日签到（每日领取 Credits）",
+        "description": desc,
+        "jump_url": jump,
+        "status": "not_accepted",
+        "current": 0,
+        "target": 1,
+        "reward_credit": 0,
+        "reward_energy": 0,
+    }
+
+
 def fetch_tasks_view(pool, realm=None, uid=None):
     """看板 /tasks 聚合：选定账号的任务行 + 全部可操作账号列表。
 
@@ -229,27 +245,51 @@ def fetch_tasks_view(pool, realm=None, uid=None):
 def run_checkin(account, gap=1.0):
     """为一个账号执行签到闭环。返回 {ok, logs, earned_credit, credits}。
 
-    不按区域门控：接口不存在按"本区域无此接口"跳过并说明，旧活动批次下线
-    （DISABLED）或活动已搬到官方客户端时，日志里给出可执行的下一步。
+    顺序（与官方现状一致）：
+      1. **活动平台**（campaign-checkin）：当前"每日领取 100 Credits"等限时活动
+         的真实入口——带桌面端请求头列出活动 → 对 CLAIMABLE 的 Credits 活动
+         POST /claim（幂等，已领过返回 replayed）。双区域通用。
+      2. 旧 sash 签到接口：活动平台没拿到东西时兜底（老账号/老活动仍可能有效）。
     """
     logs = []
     name = account.nickname or account.uid[:8]
     logs.append(f"开始为账号 [{name}] 执行每日签到...")
 
+    # --- 1) 活动平台（官方现行机制） ---
+    camp = account.campaign_checkin()
+    earned = 0
+    if camp.get("claimed"):
+        keys = ", ".join(c.get("campaign_key") or c.get("campaign_id")
+                         for c in camp["claimed"])
+        earned = int(camp.get("earned") or 0)
+        logs.append(f"✓ [{name}] 活动领取成功 +{earned} Credits（{keys}）")
+    elif camp.get("already"):
+        keys = ", ".join(c.get("campaign_key") or c.get("campaign_id")
+                         for c in camp["already"])
+        logs.append(f"✓ [{name}] 今日活动奖励已领取（{keys}）")
+    elif camp.get("ok"):
+        logs.append(f"— [{name}] {camp.get('message')}")
+    else:
+        logs.append(f"! [{name}] 活动平台查询失败：{camp.get('error')}")
+
+    if camp.get("claimed") or camp.get("already") or camp.get("ok"):
+        time.sleep(gap)
+        if account.fetch_credits().get("ok"):
+            logs.append(f"  当前额度余额: {account.credits.get('remain', 0)}")
+        account.fetch_plan()
+        return {"ok": True, "logs": logs, "earned_credit": earned,
+                "credits": account.credits, "campaign": camp.get("message")}
+
+    # --- 2) 旧 sash 签到接口兜底 ---
     # Account.checkin() 内部已带状态前置与 DISABLED 守卫（不硬 claim）
     res2 = account.checkin()
-    earned = 0
     if res2.get("ok"):
-        if res2.get("unavailable"):
-            logs.append(f"— [{name}] {res2.get('msg')}")
-            _log_campaign_hint(account, logs, name)
-            return {"ok": True, "logs": logs, "earned_credit": 0,
-                    "credits": account.credits, "unavailable": True}
-        if res2.get("disabled"):
+        if res2.get("unavailable") or res2.get("disabled"):
             logs.append(f"— [{name}] {res2.get('msg')}，本次跳过")
-            _log_campaign_hint(account, logs, name)
             return {"ok": True, "logs": logs, "earned_credit": 0,
-                    "credits": account.credits, "disabled": True}
+                    "credits": account.credits,
+                    "unavailable": bool(res2.get("unavailable")),
+                    "disabled": bool(res2.get("disabled"))}
         if res2.get("already"):
             logs.append(f"✓ [{name}] {res2.get('msg')}")
         else:
@@ -268,28 +308,6 @@ def run_checkin(account, gap=1.0):
     account.fetch_plan()
     return {"ok": True, "logs": logs, "earned_credit": earned,
             "credits": account.credits}
-
-
-def _log_campaign_hint(account, logs, name):
-    """旧签到接口不可用时，补一行官方活动平台的真实状态（避免"没效果"的观感）。"""
-    camp = account.campaigns()
-    if not camp.get("ok"):
-        logs.append("  活动平台状态查询失败: %s"
-                    % (camp.get("error") or "本区域无 /me/campaigns 接口"))
-        return
-    if camp.get("claimable"):
-        logs.append("  ⚑ 活动平台有可领取权益：请在官方客户端打开 %s"
-                    % (camp.get("campaign_url") or "活动页"))
-        return
-    keys = [c.get("campaign_key") or c.get("campaign_id")
-            for c in camp.get("campaigns") or []]
-    keys = [k for k in keys if k]
-    if keys:
-        logs.append("  活动平台登记 %d 项活动（%s），当前账号无可领取项"
-                    % (len(keys), ", ".join(keys)[:120]))
-    else:
-        logs.append("  活动平台当前无该账号可参与的活动"
-                    "（每日领取 100 Credits 需在官方桌面端内领取）")
 
 
 def run_pro_claim(account):

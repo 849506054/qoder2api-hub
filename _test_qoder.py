@@ -1036,8 +1036,11 @@ check("keeps template system when client has none",
 check("multi-turn order kept",
       [m["role"] for m in body2["messages"]] == ["system", "user", "assistant", "user"])
 check("max_tokens forwarded", body2["parameters"].get("max_tokens") == 500)
-check("reasoning_effort forwarded",
-      body2["parameters"].get("reasoning_effort") == "high")
+# 思考档位按官方词表归一化（见 [20]）：qmodel 只有开/关、无档位表，
+# 下发档位会被上游静默忽略，故此处不再透传（none 仍可用于关闭思考）
+check("level-less model drops reasoning_effort (upstream ignores it anyway)",
+      "reasoning_effort" not in body2["parameters"],
+      body2["parameters"].get("reasoning_effort"))
 check("client tools kept", len(body2["tools"]) == 1)
 check("latest prompt is c", body2["chat_context"]["text"]["text"] == "c")
 
@@ -1455,9 +1458,28 @@ def _stub_status(self):
 
 
 A.Account.checkin_status = _stub_status
-A.Account.campaigns = lambda self: {
-    "ok": True, "available": True, "show_campaign": False, "claimable": False,
-    "campaign_url": "", "campaigns": []}
+# 活动平台：intl 已领取、cn 可领取（100 Credits）—— 与官方桌面端真实形态一致
+_A_CAMPAIGNS = {
+    "intl": {"ok": True, "available": True, "show_campaign": True,
+             "claimable": False, "campaign_url": "https://openapi.qoder.sh/growth-page/activity-iframe",
+             "campaigns": [{"campaign_id": "c-intl", "campaign_key": "act-intl",
+                            "action_type": "VIEW_DETAILS", "claim_status": "CLAIMED",
+                            "start_at": 0, "end_at": 0,
+                            "benefit": {"kind": "", "amount": 0},
+                            "required_achievement_key": "",
+                            "achievement_completed": False, "unavailable_reason": "",
+                            "placements": []}]},
+    "cn": {"ok": True, "available": True, "show_campaign": True,
+           "claimable": True, "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+           "campaigns": [{"campaign_id": "c-cn", "campaign_key": "act-daily-100",
+                          "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                          "start_at": 0, "end_at": 0,
+                          "benefit": {"kind": "CREDITS", "amount": 100},
+                          "required_achievement_key": "",
+                          "achievement_completed": False, "unavailable_reason": "",
+                          "placements": []}]},
+}
+A.Account.campaigns = lambda self: dict(_A_CAMPAIGNS[self.realm])
 A.Account.fetch_credits = lambda self: {"ok": True, "credits": {}}
 A.Account.fetch_plan = lambda self: ""
 A.Account.pro_eligibility = lambda self: (True, False)
@@ -1477,16 +1499,25 @@ check("intl account is selectable in the task center",
 check("task center lists BOTH realms",
       {a["realm"] for a in _view_all["accounts"]} == {"cn", "intl"},
       _view_all["accounts"])
+_intl_row = [t for t in _view_intl["tasks"] if t["task_code"] == "daily_checkin"][0]
+_cn_row = [t for t in _view_cn["tasks"] if t["task_code"] == "daily_checkin"][0]
+check("intl: claimed campaign renders as 今日已领取 (not an empty row)",
+      _intl_row["status"] == "claimed" and "今日已领取" in _intl_row["description"],
+      _intl_row)
+check("cn: CLAIMABLE campaign renders as 待领奖 + reward amount",
+      _cn_row["status"] == "completed" and _cn_row["reward_credit"] == 100
+      and "领取" in _cn_row["description"], _cn_row)
+check("legacy DISABLED endpoint no longer produces a noise row",
+      "daily_checkin_legacy" not in [t["task_code"] for t in _view_cn["tasks"]],
+      [t["task_code"] for t in _view_cn["tasks"]])
 _codes = [t["task_code"] for t in _view_intl["tasks"]]
-check("intl check-in row explains the missing endpoint (not silent)",
-      "daily_checkin" in _codes
-      and "接口" in [t for t in _view_intl["tasks"]
-                     if t["task_code"] == "daily_checkin"][0]["description"],
-      _view_intl["tasks"][0])
-check("campaign platform row present with jump url",
-      any(t["task_code"] == "campaign_platform" for t in _view_intl["tasks"]))
-check("campaign state surfaced in summary",
-      "campaigns" in _view_intl["summary"])
+check("campaign state surfaced in summary (show/claimable/url/items)",
+      _view_intl["summary"]["campaigns"]["show"] is True
+      and _view_intl["summary"]["campaigns"]["items"][0]["key"] == "act-intl",
+      _view_intl["summary"]["campaigns"])
+check("daily row carries a jump url (campaignUrl or activities page)",
+      bool(_intl_row.get("jump_url")) and "qoder" in _intl_row["jump_url"],
+      _intl_row.get("jump_url"))
 
 print()
 print("[19] gateway host failover (official intl api1 -> api2; CN single host)")
@@ -1549,6 +1580,142 @@ check("failover: both hosts were tried in order (api1 then api2)",
 check("failover: signature path unchanged across hosts",
       _hits19[0].split("?")[0].endswith(P.CHAT_PATH.split("?")[0]),
       _hits19[0])
+
+print()
+print("[20] campaign check-in (the real daily-claim API) + effort normalization")
+
+# --- 20.1 桌面端请求头（活动平台必需；缺了服务端返回空列表） ---
+_hdrs = _t_cn.desktop_headers()
+check("desktop headers carry Cosy-ClientType=10 + Cosy-Version + UA Qoder",
+      _hdrs["cosy-clienttype"] == "10" and _hdrs["User-Agent"] == "Qoder"
+      and bool(_hdrs["cosy-version"]), _hdrs.get("cosy-clienttype"))
+check("desktop headers carry the machine identity set",
+      all(_hdrs.get(k) for k in ("cosy-machineid", "cosy-machinetoken",
+                                 "cosy-machinetype", "cosy-machineos",
+                                 "cosy-machinehostname")))
+check("desktop headers keep the Bearer token",
+      _hdrs["Authorization"].startswith("Bearer "))
+check("campaign claim/reward path templates (official growth-page contract)",
+      A.PATH_CAMPAIGN_CLAIM == "/sash/api/v1/me/campaigns/%s/claim"
+      and A.PATH_CAMPAIGN_REWARD == "/sash/api/v1/me/campaigns/%s/reward")
+
+# --- 20.2 campaign_checkin: 只领取 CLAIMABLE + CLAIM_BENEFIT，幂等视为已领 ---
+_orig_claim = A.Account.claim_campaign
+_calls20 = []
+
+
+def _stub_claim(self, campaign_id):
+    _calls20.append(campaign_id)
+    return {"ok": True, "status": "CLAIMED", "replayed": False, "grant_id": "g1",
+            "amount": 100, "message": "领取成功"}
+
+
+A.Account.claim_campaign = _stub_claim
+A.Account.campaigns = lambda self: {
+    "ok": True, "available": True, "show_campaign": True, "claimable": True,
+    "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+    "campaigns": [
+        {"campaign_id": "c1", "campaign_key": "act-daily-100",
+         "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+         "start_at": 0, "end_at": 0, "benefit": {"kind": "CREDITS", "amount": 100},
+         "placements": []},
+        {"campaign_id": "c2", "campaign_key": "act-view-only",
+         "action_type": "VIEW_DETAILS", "claim_status": "CLAIMABLE",
+         "start_at": 0, "end_at": 0, "benefit": {"kind": "", "amount": 0},
+         "placements": []},
+        {"campaign_id": "c3", "campaign_key": "act-done",
+         "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMED",
+         "start_at": 0, "end_at": 0, "benefit": {"kind": "CREDITS", "amount": 100},
+         "placements": []},
+    ]}
+_acc20 = A.Account({"uid": "cp20", "realm": "cn", "accessToken": "dt-x"})
+try:
+    _res20 = _acc20.campaign_checkin(gap=0)
+finally:
+    A.Account.claim_campaign = _orig_claim
+    A.Account.campaigns = _orig_camp
+
+check("only CLAIMABLE CLAIM_BENEFIT campaigns are claimed",
+      _calls20 == ["c1"], _calls20)
+check("VIEW_DETAILS campaign is not claimed", "c2" not in _calls20)
+check("already-CLAIMED campaign is not re-posted", "c3" not in _calls20)
+check("campaign_checkin reports earned credits + already list",
+      _res20["earned"] == 100 and len(_res20["claimed"]) == 1
+      and len(_res20["already"]) == 1, _res20.get("message"))
+check("campaign_checkin stamps last_checkin on success", bool(_acc20.last_checkin))
+check("campaign_checkin message names the claimed campaign",
+      "act-daily-100" in _res20["message"], _res20["message"])
+
+# --- 20.3 幂等：上游 replayed=true 视为已领取而不是新领取 ---
+A.Account.campaigns = lambda self: {
+    "ok": True, "available": True, "show_campaign": True, "claimable": True,
+    "campaign_url": "", "campaigns": [
+        {"campaign_id": "c9", "campaign_key": "act-x",
+         "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+         "start_at": 0, "end_at": 0, "benefit": {"kind": "CREDITS", "amount": 100},
+         "placements": []}]}
+A.Account.claim_campaign = lambda self, cid: {
+    "ok": True, "status": "CLAIMED", "replayed": True, "grant_id": "g9",
+    "amount": 100, "message": "已领取"}
+try:
+    _res21 = _acc20.campaign_checkin(gap=0)
+finally:
+    A.Account.claim_campaign = _orig_claim
+    A.Account.campaigns = _orig_camp
+check("replayed claim counted as already (no phantom credits)",
+      _res21["earned"] == 0 and len(_res21["already"]) == 1
+      and not _res21["claimed"], _res21.get("message"))
+
+# --- 20.4 思考档位归一化（官方词表因模型而异，未命中会被上游静默忽略） ---
+_meta_df = next(m for m in C.models_for_realm("cn") if m["key"] == "dfmodel")
+_meta_qf = next(m for m in C.models_for_realm("cn") if m["key"] == "qfmodel")
+_meta_qm = next(m for m in C.models_for_realm("cn") if m["key"] == "qmodel")
+check("supported_efforts reads the official levels",
+      P.supported_efforts(_meta_qf) == ["low", "medium", "xhigh"]
+      and P.supported_efforts(_meta_df) == ["low", "high", "max"]
+      and P.supported_efforts(_meta_qm) == [], P.supported_efforts(_meta_df))
+check("default_effort reads the official is_default mark",
+      P.default_effort(_meta_qf) == "medium" and P.default_effort(_meta_df) == "max",
+      (P.default_effort(_meta_qf), P.default_effort(_meta_df)))
+_v, _n = P.normalize_reasoning_effort("none", _meta_qf)
+check("none stays none (universal off switch)", _v == "none")
+_v, _n = P.normalize_reasoning_effort("medium", _meta_qf)
+check("supported level passes through untouched", _v == "medium" and not _n, _n)
+_v, _n = P.normalize_reasoning_effort("medium", _meta_df)
+check("unsupported level maps to the nearest legal one (dfmodel medium->high)",
+      _v == "high" and "unsupported" in _n, (_v, _n))
+_v, _n = P.normalize_reasoning_effort("xhigh", _meta_df)
+check("dfmodel xhigh -> max (nearest to request/default)", _v == "max", (_v, _n))
+_v, _n = P.normalize_reasoning_effort("max", _meta_qf)
+check("qfmodel max -> xhigh", _v == "xhigh", (_v, _n))
+_v, _n = P.normalize_reasoning_effort("high", _meta_qf)
+check("qfmodel high -> medium (tie broken toward the default)",
+      _v == "medium", (_v, _n))
+_v, _n = P.normalize_reasoning_effort("low", _meta_qm)
+check("model without levels: effort param is dropped (not sent blindly)",
+      _v is None and "dropped" in _n, (_v, _n))
+_v, _n = P.normalize_reasoning_effort("none", _meta_qm)
+check("model without levels still honours none", _v == "none")
+
+# build_qoder_body: 端到端确认发到上游的档位已归一化 + thinking.* 兼容
+_body_eff = P.build_qoder_body(
+    {"model": "dfmodel", "messages": [{"role": "user", "content": "hi"}],
+     "reasoning_effort": "medium"}, None, "dfmodel", realm="cn")
+check("build_qoder_body sends the normalized effort upstream",
+      (_body_eff.get("parameters") or {}).get("reasoning_effort") == "high",
+      (_body_eff.get("parameters") or {}).get("reasoning_effort"))
+_body_th = P.build_qoder_body(
+    {"model": "qfmodel", "messages": [{"role": "user", "content": "hi"}],
+     "thinking": {"effort": "xhigh"}}, None, "qfmodel", realm="cn")
+check("thinking.effort is accepted as an alias",
+      (_body_th.get("parameters") or {}).get("reasoning_effort") == "xhigh",
+      (_body_th.get("parameters") or {}).get("reasoning_effort"))
+_body_off = P.build_qoder_body(
+    {"model": "qmodel", "messages": [{"role": "user", "content": "hi"}],
+     "reasoning_effort": "high"}, None, "qmodel", realm="cn")
+check("unsupported effort on a level-less model is dropped from the body",
+      "reasoning_effort" not in (_body_off.get("parameters") or {}),
+      _body_off.get("parameters"))
 
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))

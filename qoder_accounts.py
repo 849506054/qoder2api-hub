@@ -27,7 +27,8 @@ import urllib.request
 from pathlib import Path
 import uuid
 
-from qoder_fingerprint import derive_id, generate_request_id
+from qoder_fingerprint import (derive_id, generate_request_id,
+                               derive_machine_token, derive_machine_type)
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -94,6 +95,25 @@ PATH_PRO_CLAIM = "/sash/api/v1/me/pro-upgrade/claim"
 # 官方新活动平台（双区域通用，实测 cn/intl 均 200）：服务端下发活动列表与
 # campaignUrl/JS，领取动作由桌面客户端承接；网关用它做状态呈现与提示。
 PATH_CAMPAIGNS = "/sash/api/v1/me/campaigns"
+# 单个活动的奖励查询 / 领取（逆向自官方 growth-page/activity-iframe 页面：
+#   GET  /sash/api/v1/me/campaigns/{campaignId}/reward
+#   POST /sash/api/v1/me/campaigns/{campaignId}/claim   —— 领取（幂等：
+#        已领取返回 {"status":"CLAIMED","replayed":true}，不会重复发放）
+PATH_CAMPAIGN_REWARD = "/sash/api/v1/me/campaigns/%s/reward"
+PATH_CAMPAIGN_CLAIM = "/sash/api/v1/me/campaigns/%s/claim"
+
+# 桌面端专用请求头（活动平台必需；CLI=5 / QoderWork=6 / 桌面端=10）
+DESKTOP_CLIENT_TYPE = "10"
+DESKTOP_CLIENT_VERSION = "0.4.3"      # 可用 QD_DESKTOP_VERSION 覆盖
+MACHINE_OS = "x86_64_win32"
+MACHINE_HOSTNAME = "DESKTOP-QODER"
+
+
+def desktop_version():
+    """桌面端版本号（Cosy-Version）；客户端更新后可用环境变量覆盖，
+    或直接跑 `python _refresh_catalog.py` 时按已安装客户端自动对齐。"""
+    return (os.environ.get("QD_DESKTOP_VERSION") or DESKTOP_CLIENT_VERSION).strip() \
+        or DESKTOP_CLIENT_VERSION
 
 # 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
 # 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
@@ -437,6 +457,30 @@ class Account(object):
             "Referer": cfg["website"] + "/",
         }
 
+    def desktop_headers(self):
+        """桌面端 0.4.3 同款出站头（活动平台 /sash/... 必需）。
+
+        官方桌面端调用 `/sash/api/v1/me/campaigns` 时携带：
+          Authorization: Bearer <token>
+          User-Agent: Qoder
+          Cosy-ClientType: 10（桌面端；CLI 是 5、QoderWork 是 6）
+          Cosy-Version: <桌面端版本>
+          Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
+          MachineType / MachineCode
+        缺这些头时服务端**不报错但返回空活动列表**（`showCampaign=false,
+        campaigns=[]`），这正是此前"签到不成功"的根因。
+        """
+        h = dict(self.headers())
+        h["User-Agent"] = "Qoder"
+        h["cosy-clienttype"] = DESKTOP_CLIENT_TYPE
+        h["cosy-version"] = desktop_version()
+        h["cosy-machineid"] = derive_id(self.uid, "machine")
+        h["cosy-machinetoken"] = derive_machine_token(self.uid)
+        h["cosy-machinetype"] = derive_machine_type(self.uid)
+        h["cosy-machineos"] = MACHINE_OS
+        h["cosy-machinehostname"] = MACHINE_HOSTNAME
+        return h
+
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
         """刷新 access token。drt- 走 deviceToken，jrt-/PAT 走 jobToken。
@@ -652,23 +696,37 @@ class Account(object):
     def campaigns(self):
         """GET /sash/api/v1/me/campaigns -> 官方活动平台状态（双区域通用）。
 
-        官方把"每日领取 100 Credits"等限时活动搬到了 campaign 平台：列表里
-        的 campaignUrl / placements[].commands[].js 由服务端下发，领取动作在
-        桌面客户端内完成（网关不执行服务端下发的 JS，只做状态呈现）。
-        返回 {ok, available, show_campaign, claimable, campaign_url, campaigns}。
+        官方把"每日领取 100 Credits"等限时活动搬到了 campaign 平台：
+        **必须用桌面端请求头**（`desktop_headers()`：Cosy-ClientType 10 +
+        机器头 + UA Qoder），否则服务端不报错但返回空列表——这正是此前
+        "看过活动页却领不到 / 网关显示无活动"的根因（对照官方桌面端
+        0.4.3 的 main.log：同一账号同一路径，带桌面头时 `claimable=true`）。
+
+        返回 {ok, available, show_campaign, claimable, campaign_url, campaigns}，
+        每条活动含 action_type / claim_status / benefit（Credits 数量）/ end_at。
         """
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_CAMPAIGNS
         try:
-            q = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=1)
+            q = http_json(url, method="GET", headers=self.desktop_headers(),
+                          timeout=15, retries=1)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
             except Exception:
                 body = ""
-            return {"ok": False, "available": exc.code not in (404, 405, 410),
-                    "error": "HTTP %d %s" % (exc.code, body[:160])}
+            # 桌面端头被拒（401/403）时回退普通头，至少保留"能不能看到"的信息
+            if exc.code in (401, 403):
+                try:
+                    q = http_json(url, method="GET", headers=self.headers(),
+                                  timeout=15, retries=1)
+                except Exception as exc2:
+                    return {"ok": False, "available": True,
+                            "error": "HTTP %d (desktop) / %s (plain)"
+                                     % (exc.code, exc2)}
+            else:
+                return {"ok": False, "available": exc.code not in (404, 405, 410),
+                        "error": "HTTP %d %s" % (exc.code, body[:160])}
         except Exception as exc:
             return {"ok": False, "available": True, "error": str(exc)}
         items = []
@@ -677,11 +735,22 @@ class Account(object):
             if not isinstance(c, dict):
                 continue
             placements = c.get("placements")
+            benefit = c.get("benefit") if isinstance(c.get("benefit"), dict) else {}
             items.append({
                 "campaign_id": str(c.get("campaignId") or c.get("campaign_id") or ""),
                 "campaign_key": str(c.get("campaignKey") or c.get("campaign_key") or ""),
+                "action_type": str(c.get("actionType") or c.get("action_type") or ""),
+                "claim_status": str(c.get("claimStatus") or c.get("claim_status") or ""),
                 "start_at": normalize_epoch(c.get("startAt") or c.get("start_at")),
                 "end_at": normalize_epoch(c.get("endAt") or c.get("end_at")),
+                "benefit": {
+                    "kind": str(benefit.get("kind") or ""),
+                    "amount": int(benefit.get("amount") or 0),
+                },
+                "required_achievement_key": str(
+                    c.get("requiredAchievementKey") or ""),
+                "achievement_completed": bool(c.get("achievementCompleted")),
+                "unavailable_reason": str(c.get("unavailableReason") or ""),
                 "placements": placements if isinstance(placements, list) else [],
             })
         st = {
@@ -694,6 +763,106 @@ class Account(object):
         }
         self.campaign_status = st
         return st
+
+    def campaign_reward(self, campaign_id):
+        """GET …/campaigns/{id}/reward -> 该活动的发放状态（幂等，只读）。"""
+        cfg = get_realm_config(self.realm)
+        url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
+        try:
+            return http_json(url, method="GET", headers=self.desktop_headers(),
+                             timeout=20, retries=1)
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def claim_campaign(self, campaign_id):
+        """POST …/campaigns/{id}/claim -> 领取该活动奖励（官方幂等语义）。
+
+        返回 {ok, status, replayed, grant_id, amount, message}；
+        已领取时上游返回 status=CLAIMED + replayed=true（不会重复发放）。
+        """
+        cfg = get_realm_config(self.realm)
+        url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
+        try:
+            r = http_json(url, data=b"{}", method="POST",
+                          headers=self.desktop_headers(), timeout=20, retries=1)
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            code = ""
+            try:
+                code = str((json.loads(body) or {}).get("errorCode") or "")
+            except Exception:
+                code = ""
+            if exc.code == 409 or code.upper() in ("ALREADY_CLAIMED", "REPLAYED"):
+                return {"ok": True, "status": "CLAIMED", "replayed": True,
+                        "message": "今日已领取（上游幂等确认）"}
+            return {"ok": False, "error": "HTTP %d %s" % (exc.code, body[:160])}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        status = str(r.get("status") or "")
+        if not status and r.get("success") is False:
+            return {"ok": False, "error": str(r.get("error") or r)[:160]}
+        return {
+            "ok": status.upper() in ("CLAIMED", "GRANTED", "SUCCESS") or bool(r),
+            "status": status,
+            "replayed": bool(r.get("replayed")),
+            "grant_id": str(r.get("grantId") or ""),
+            "amount": int(((r.get("benefit") or {}) if isinstance(r.get("benefit"), dict)
+                           else {}).get("amount") or r.get("amount") or 0),
+            "message": "已领取" if r.get("replayed") else "领取成功",
+            "raw": r,
+        }
+
+    def campaign_checkin(self, gap=0.5):
+        """活动平台签到：领取所有 CLAIMABLE 的 Credits 活动（每日 100 等）。
+
+        返回 {ok, claimed:[...], already:[...], earned, message, campaigns}
+          - 已是 CLAIMED 的活动计入 already（"今日已领取"）
+          - 无可领取项且没有任何活动 -> ok=True + message 说明
+        """
+        st = self.campaigns()
+        if not st.get("ok"):
+            return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
+                    "earned": 0, "claimed": [], "already": []}
+        claimed, already, earned, errors = [], [], 0, []
+        for c in st["campaigns"]:
+            if c["claim_status"] == "CLAIMED":
+                already.append(c)
+                continue
+            if c["claim_status"] != "CLAIMABLE":
+                continue
+            if c["action_type"] and c["action_type"] != "CLAIM_BENEFIT":
+                continue      # VIEW_DETAILS 类活动无需（也不能）领取
+            res = self.claim_campaign(c["campaign_id"])
+            if res.get("ok"):
+                amount = res.get("amount") or c["benefit"]["amount"] or 0
+                self._stamp_checkin()
+                if res.get("replayed"):
+                    already.append(c)
+                else:
+                    claimed.append(c)
+                    earned += int(amount or 0)
+                time.sleep(max(0.0, gap))
+            else:
+                errors.append("%s: %s" % (c["campaign_key"] or c["campaign_id"],
+                                          res.get("error")))
+        if claimed:
+            msg = "活动领取成功 +%d Credits（%s）" % (
+                earned, ", ".join(c["campaign_key"] or c["campaign_id"]
+                                  for c in claimed))
+        elif already:
+            msg = "今日活动奖励已领取（%s）" % ", ".join(
+                c["campaign_key"] or c["campaign_id"] for c in already)
+        elif errors:
+            msg = "活动领取失败：%s" % "; ".join(errors)[:200]
+        else:
+            msg = "当前账号暂无可领取的官方活动"
+        return {"ok": not errors, "claimed": claimed, "already": already,
+                "earned": earned, "message": msg, "campaigns": st["campaigns"],
+                "errors": errors}
+
 
     def _stamp_checkin(self):
         self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")

@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.1.0-2496ED?style=flat-square" alt="Version 1.1.0">
+  <img src="https://img.shields.io/badge/Release-v1.1.1-2496ED?style=flat-square" alt="Version 1.1.1">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -18,7 +18,7 @@
 - **COSY 签名推理链路**：RSA 包裹 AES 会话密钥 + MD5 请求签名 + 自定义 Base64 请求体编码，纯标准库实现（含 AES-128/256、RSA-PKCS1v15、GCM、DPAPI、QMC 纯 Python 实现，Docker alpine 下同样零依赖），逆向对齐官方桌面/CLI 客户端协议。
 - **稳定物理设备指纹隔离 (`derive_id`)**：以账号自身 UID 稳定哈希派生专属 `cosy-machineid` / `cosy-machinetoken` / 会话标识，同一账号长期固定在同一台虚拟物理设备，天然防多号关联风控。
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
-- **每日签到与额度体系（双区域 · 运行时能力探测）**：签到能力不再按区域硬编码——接口 404/405/410 记「本区域无此接口」（缓存 6 小时后自动重探），`status=DISABLED` 时诚实跳过不硬领；官方新活动平台 `GET /sash/api/v1/me/campaigns`（双区域通用）用于呈现「每日领取 100 Credits」等限时活动的真实状态（领取在官方客户端内完成）；Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
+- **每日签到与额度体系（双区域 · 真实领取）**：「每日领取 100 Credits」等活动**由网关直接领取**——用桌面端请求头（`Cosy-ClientType: 10` + 机器头，缺了服务端会返回空列表）列出活动 → 对 `CLAIMABLE` 的 Credits 活动 `POST /sash/api/v1/me/campaigns/{id}/claim`（官方幂等：已领返回 `replayed`，不会重复发放）；旧 sash 签到接口仅在仍开放时兜底（能力运行时探测，404 记「本区域无此接口」6 小时后自动重探）；Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
 - **后台常驻定时调度器**：每日整点排程（09:00 / 21:00 签到 · 22:00 Token 集中保活），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
 - **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译与 DSML 工具调用回退解析。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
@@ -149,6 +149,17 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 - 国内版主机 `gateway.qoder.com.cn`、双区 `openapi` 基址、`/algo/api/v2/service/pro/sse/agent_chat_generation`（推理）、`/algo/api/v2/model/list`（模型清单）、`/api/v1/deviceToken|jobToken/*`、`/api/v1/userinfo`、`/api/v2/quota/usage`、`/api/v2/user/plan`、`/sash/api/v1/me/*`（签到/活动平台）**均与新客户端一致**，无变化；
 - COSY RSA 公钥与新客户端内置 PEM **逐字节相同**；官方模型目录快照已用新版客户端缓存刷新（价格倍率/上下文/思考默认档等）。
 
+**思考档位（`reasoning_effort`）归一化**：官方上游字段就是 `parameters.reasoning_effort`（0.4.3 SDK 参数表里的 `reasoning_effort`，取值 `none`/`low`/`medium`/`high`/`xhigh`/`max`），但**每个模型的合法档位不同**，而**上游对不支持的档位不报错、直接忽略（回落到模型默认档）**——这就是"给 Qwen3.8-Flash 传档位没反应"的原因：
+
+| 模型 | 官方支持档位 | 默认 | 传 `medium`/`high` 会怎样 |
+|---|---|---|---|
+| `qfmodel`（Qwen3.8-Flash） | `low` / `medium` / `xhigh` | `medium` | `medium` 生效；`high` 不在表内 → 被忽略 |
+| `qmodel_38max`（Qwen3.8-Max） | `low` / `medium` / `xhigh` | `medium` | 同上 |
+| `dfmodel`（DeepSeek-Flash） | `low` / `high` / `max` | `max` | `medium`/`xhigh` 都不在表内 → 被忽略（实测输出与默认档一致） |
+| `qmodel`（Qwen3.7-Plus） | 无档位（仅开/关） | — | 任何档位都被忽略（只有 `none` 能关掉思考） |
+
+网关现在按**官方目录里该模型的档位表**归一化（`normalize_reasoning_effort()`）：命中原样透传；未命中取"最近的合法档位"（同距时偏向该模型默认档，如 `dfmodel` 的 `medium→high`、`xhigh→max`，`qfmodel` 的 `high→medium`、`max→xhigh`），并在日志标注；模型没有档位表时**不再把无效档位发给上游**（只保留 `none`）。`/v1/models` 的 `reasoning_efforts` / `reasoning_default_effort` 字段即为该模型的合法档位与默认档。另兼容 `reasoning.effort` 与 `thinking.effort/level` 三种客户端写法。
+
 ```
 客户端 OpenAI 请求
   → build_qoder_body()   官方 baseprompt 模板 + 会话压平（system/工具/参数覆写）
@@ -196,12 +207,14 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 - **同一账号长期稳定**：出站请求永远来自同一台虚拟物理设备，规避机器码漂移风控；
 - **多账号天然隔离**：不同账号机器码彼此独立，阻断跨账号关联检测。
 
-### 3. 每日签到、额度与 Pro 福利包（双区域 · 运行时候能力探测）
+### 3. 每日签到、额度与 Pro 福利包（双区域 · 真实领取）
 
-- **每日签到**：`GET /sash/api/v1/me/daily-check-in/status` → 未签则 `POST …/claim`（+100 积分）；409 `ALREADY_CLAIMED` 归一化为「今日已签到」；上游活动停用（`status=DISABLED`）时诚实跳过、不硬领；签到后即时刷新额度快照；
-- **签到能力是运行时探测的，不按区域硬编码**（`Account.checkin_capability()`）：接口返回 404/405/410 记为「本区域无此接口」，缓存 6 小时（`CHECKIN_PROBE_TTL`）后自动重探——官方在任一区域上线/下线都能自动跟随。实测：国内版 `status=DISABLED`（`campaignKey=cn_daily_check_in_legacy`），国际版 `daily-check-in/*` 全 404；
-- **官方活动平台**（`GET /sash/api/v1/me/campaigns`，双区域均 200）：新活动（「每日领取 100 Credits」等）由服务端下发 `campaignUrl`/`placements[].commands[].js`，**领取动作在官方桌面客户端内完成**——网关只做状态呈现（任务中心的「限时活动」行 + 签到跳过原因），不执行服务端下发的 JS；
-- **不再静默**：旧接口不可用时任务中心/批量签到/调度器会给出明确原因（「本区域未开放旧版签到接口（HTTP 404），活动改由官方客户端承接」），而不是点了没反应；
+**当前官方机制 = 活动平台领取**（`Account.campaign_checkin()`），网关直接完成领取：
+
+- **列表**：`GET /sash/api/v1/me/campaigns`（双区域通用）——**必须带桌面端请求头**（`Cosy-ClientType: 10` + `Cosy-Version` + `Cosy-MachineOS/Hostname/Id/Token/Type` + `UA: Qoder`）。缺这些头时服务端**不报错、直接返回空列表**（`showCampaign=false, campaigns=[]`），这正是此前"活动页能看、网关领不到"的根因（对照官方桌面端 0.4.3 的 `main.log`：同一账号同一路径，带桌面头时 `claimable=true`）；
+- **领取**：对 `claimStatus=CLAIMABLE` 且 `actionType=CLAIM_BENEFIT` 的活动 `POST /sash/api/v1/me/campaigns/{campaignId}/claim`（逆向自官方 `growth-page/activity-iframe` 页面 JS）。**官方幂等**：已领取返回 `{"status":"CLAIMED","replayed":true}`，不会重复发放；`GET …/{id}/reward` 可查发放状态；
+- **任务中心**：`daily_checkin` 行直接反映真实活动状态——可领取显示「可领取 100 Credits（act-…）—— 点『一键签到』自动领取」，已领取显示「今日已领取 +100 Credits，明日再来」；
+- **旧 sash 接口**（`/sash/api/v1/me/daily-check-in/*`）仅在仍开放时作为兜底并附一行历史状态；能力运行时探测（404/405/410 记「本区域无此接口」，6 小时后自动重探）。实测国内版 `status=DISABLED`、国际版全 404；
 - **额度体系**：`/api/v2/quota/usage` 聚合基础额度 + 赠送/签到额度；`/api/v2/user/plan` 套餐名（Pro Trial 等）；
 - **Pro 福利包**：一次性 +1800 积分，`eligibility → claim` 两步走（端点 404 时视为活动未开放）；
 - **看板「签到与福利中心」**：连续签到天数、积分余额、福利包状态卡片 + 任务行表格，支持单账号/批量；国内版与国际版账号都会列出。
@@ -338,6 +351,17 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.1.1
+
+**签到真正做到「能领到」（双区域）**
+- **根因**：官方活动平台 `/sash/api/v1/me/campaigns` 必须携带**桌面端请求头**（`Cosy-ClientType: 10` + `Cosy-Version` + 机器头 + `UA: Qoder`）；此前网关用普通 openapi 头请求，服务端不报错但返回**空活动列表** → 看板上永远是"无活动"；
+- **现在直接领取**：对 `CLAIMABLE` 的 Credits 活动 `POST /sash/api/v1/me/campaigns/{id}/claim`（逆向自官方 `growth-page/activity-iframe` 页面 JS，**官方幂等**：已领返回 `replayed=true`，不会重复发放）；任务中心显示「可领取 100 Credits —— 点『一键签到』自动领取」/「今日已领取 +100 Credits」；
+- 旧 sash 签到接口降级为兜底（仅在仍开放时附一行历史状态）。
+
+**思考档位 `reasoning_effort` 归一化（回答"Qwen3.8-Flash 传档位没反应"）**
+- 字段名确认无误（官方 0.4.3 SDK 参数表即 `reasoning_effort`），但**各模型合法档位不同**，且**上游对不支持的档位静默忽略**：`qfmodel` 只认 `low/medium/xhigh`（传 `high` 无效）、`dfmodel` 只认 `low/high/max`（传 `medium/xhigh` 无效）、`qmodel` 只有开/关；
+- 网关改为按官方目录的档位表归一化：未命中取最近合法档位（`dfmodel`：`medium→high`、`xhigh→max`；`qfmodel`：`high→medium`、`max→xhigh`）并记日志；无档位表的模型不再下发无效档位；`none` 始终可用于关闭思考；兼容 `reasoning.effort` 与 `thinking.effort/level`。
 
 ### v1.1.0
 
