@@ -51,7 +51,7 @@ from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import get_realm_config, gateway_candidates, CLIENT_UA
 from pathlib import Path
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1947,8 +1947,9 @@ def normalize_reasoning_effort(effort, meta):
       - 关闭类取值（none/off/disabled/...）统一映射为 "none"（官方通用关闭值）；
       - 模型有档位表：命中则原样透传；未命中取"最近的合法档位"（同距时偏向
         模型默认档），并给出说明性 note；
-      - 模型无档位表（仅开/关）：除 none 外一律**不下发**该参数（避免给上游
-        发它不认识的档位）。
+      - 模型有 thinking_config 但无档位表（仅开/关）：除 none 外不下发该参数
+        （避免给上游发它不认识的档位）；
+      - 模型没有 thinking_config（如路由器 `auto`）：**原样透传**，不做猜测。
 
     返回 (value|None, note)：value=None 表示不下发 reasoning_effort。
     """
@@ -1957,6 +1958,10 @@ def normalize_reasoning_effort(effort, meta):
         return None, ""
     if e in _EFFORT_OFF:
         return "none", ""
+    tc = (meta or {}).get("thinking_config")
+    if not isinstance(tc, dict):
+        # 目录里没有该模型的思考配置（路由器/未知模型）：不猜测，原样透传
+        return e, ""
     sup = supported_efforts(meta)
     if not sup:
         return None, "dropped (model has no effort levels; use none to disable)"

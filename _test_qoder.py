@@ -19,6 +19,8 @@ os.environ.setdefault("ACCOUNTS_DIR",
 os.environ.setdefault("USAGE_DIR",
                       os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "_use"))
+# 离线测试不拉起客户端原生二进制（活动平台的机器身份桥）；测试里显式关闭
+os.environ.setdefault("QD_NATIVE_IDENTITY", "0")
 
 import qoder_proxy as P
 import qoder_sign as S
@@ -1592,7 +1594,12 @@ check("desktop headers carry Cosy-ClientType=10 + Cosy-Version + UA Qoder",
 check("desktop headers carry the machine identity set",
       all(_hdrs.get(k) for k in ("cosy-machineid", "cosy-machinetoken",
                                  "cosy-machinetype", "cosy-machineos",
-                                 "cosy-machinehostname")))
+                                 "cosy-machinehostname", "cosy-machinecode")))
+check("native identity bridge can be disabled (derived fallback)",
+      os.environ.get("QD_NATIVE_IDENTITY") == "0"
+      and _t_cn.machine_identity_source == "derived"
+      and A.runtime_info_exe("cn") == "",
+      _t_cn.machine_identity_source)
 check("desktop headers keep the Bearer token",
       _hdrs["Authorization"].startswith("Bearer "))
 check("campaign claim/reward path templates (official growth-page contract)",
@@ -1696,6 +1703,27 @@ check("model without levels: effort param is dropped (not sent blindly)",
       _v is None and "dropped" in _n, (_v, _n))
 _v, _n = P.normalize_reasoning_effort("none", _meta_qm)
 check("model without levels still honours none", _v == "none")
+# 路由器（auto 等）目录里没有 thinking_config：不猜测，原样透传
+_meta_auto = next(m for m in C.models_for_realm("cn") if m["key"] == "auto")
+check("router model without thinking_config passes the value through verbatim",
+      P.normalize_reasoning_effort("high", _meta_auto) == ("high", "")
+      and P.normalize_reasoning_effort("bogus", _meta_auto) == ("bogus", ""),
+      P.normalize_reasoning_effort("high", _meta_auto))
+# 未命中取最近合法档位：逐模型校验（同距偏向默认档）
+for _key, _want in (("dmodel", {"medium": "high", "xhigh": "max", "low": "high"}),
+                    ("gfmodel", {"medium": "high", "xhigh": "max"}),
+                    ("kmodel", {"medium": "high", "xhigh": "max"})):
+    _m = next(m for m in C.models_for_realm("cn") if m["key"] == _key)
+    _got = {e: P.normalize_reasoning_effort(e, _m)[0] for e in _want}
+    check("nearest-legal mapping on %s" % _key, _got == _want, (_got, _want))
+# Responses API 路径：reasoning.effort / reasoning_effort 都要能到上游
+_rchat = P.responses_to_chat({"model": "Qwen3.8-Flash", "input": "hi",
+                              "reasoning": {"effort": "xhigh"}})
+_rbody = P.build_qoder_body(dict(_rchat, model="Qwen3.8-Flash"), None,
+                            "qfmodel", realm="cn")
+check("Responses API reasoning.effort reaches upstream (normalized)",
+      (_rbody.get("parameters") or {}).get("reasoning_effort") == "xhigh",
+      (_rbody.get("parameters") or {}).get("reasoning_effort"))
 
 # build_qoder_body: 端到端确认发到上游的档位已归一化 + thinking.* 兼容
 _body_eff = P.build_qoder_body(

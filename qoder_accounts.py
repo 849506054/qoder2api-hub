@@ -115,6 +115,119 @@ def desktop_version():
     return (os.environ.get("QD_DESKTOP_VERSION") or DESKTOP_CLIENT_VERSION).strip() \
         or DESKTOP_CLIENT_VERSION
 
+
+# ---------------------------------------------------------------------------
+# 官方桌面端原生风控身份（activity/campaign 列表按它过滤，必须是"真"身份）
+# ---------------------------------------------------------------------------
+# 官方桌面端在调用活动平台前，会 spawn 自己的原生桥取机器身份：
+#     <install>/resources/umid/runtime-info.exe prod --account-stdin
+#     stdin: {"account": <uid>}   stdout: {"machineToken","machineType","machineCode",...}
+# 服务端**按这些值过滤设备定向活动**：派生的假身份不会报错，但活动列表里
+# 会静默少掉"每日领取 100 Credits"这类条目（实测：换用原生身份后立刻出现
+# CLAIMABLE 活动）。因此网关优先调用同一个官方二进制取真值，失败才回退派生值。
+NATIVE_IDENTITY_TTL = 6 * 3600
+_native_exe_cache = {}
+_native_ident_cache = {}
+
+
+def _localappdata():
+    return os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local")
+
+
+def _read_ini(path, key):
+    """读 launcher 的 state.ini（UTF-8 或 UTF-16），返回 key=value 的 value。"""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except Exception:
+        return ""
+    for enc in ("utf-8-sig", "utf-16"):
+        try:
+            text = raw.decode(enc)
+        except Exception:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if line.lower().startswith(key.lower() + "="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+
+def desktop_install_dir(realm):
+    """桌面端安装目录（launcher state.ini 的 installDir；找不到返回空串）。"""
+    base = _localappdata()
+    names = ("Qoder CN", "QoderCN", "Qoder") if realm == "cn" else ("Qoder",)
+    for name in names:
+        for launcher in ("%s Launcher" % name, "Launcher"):
+            ini = os.path.join(base, name, launcher, "state.ini")
+            if os.path.isfile(ini):
+                d = _read_ini(ini, "installDir")
+                if d and os.path.isdir(d):
+                    return d
+    for name in names:
+        d = os.path.join(base, "Programs", name)
+        if os.path.isdir(d):
+            return d
+    return ""
+
+
+def runtime_info_exe(realm):
+    """定位官方 runtime-info.exe（原生风控身份桥）；找不到返回空串。
+
+    可用 QD_NATIVE_IDENTITY=0 关闭（测试/受限环境不希望拉起客户端二进制时）。
+    """
+    if (os.environ.get("QD_NATIVE_IDENTITY") or "1").strip() in ("0", "false", "no"):
+        return ""
+    if realm in _native_exe_cache:
+        return _native_exe_cache[realm]
+    exe = ""
+    roots = [os.path.join(desktop_install_dir(realm), "resources", "umid")]
+    found = ""
+    for root in roots:
+        cand = os.path.join(root, "runtime-info.exe")
+        if os.path.isfile(cand):
+            found = cand
+            break
+    _native_exe_cache[realm] = found
+    return found
+
+
+def native_machine_identity(realm, account_id):
+    """调用官方原生桥取真实机器身份；任何失败返回 {}（调用方回退派生值）。
+
+    结果按 (realm) 缓存 NATIVE_IDENTITY_TTL 秒——机器身份在一台机器上稳定。
+    """
+    now = time.time()
+    hit = _native_ident_cache.get(realm)
+    if hit and now - hit[0] < NATIVE_IDENTITY_TTL:
+        return hit[1]
+    ident = {}
+    exe = runtime_info_exe(realm)
+    if exe and account_id:
+        try:
+            import subprocess
+            proc = subprocess.run(
+                [exe, "prod", "--account-stdin"],
+                input=json.dumps({"account": account_id}).encode("utf-8") + b" ",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25,
+                cwd=os.path.dirname(exe))
+            out = proc.stdout.decode("utf-8", "replace").strip()
+            if out:
+                data = json.loads(out.split("\n", 1)[0])
+                token = str(data.get("machineToken") or "").strip()
+                mtype = str(data.get("machineType") or "").strip()
+                code = str(data.get("machineCode") or "").strip()
+                if token and mtype and code:
+                    ident = {"machineToken": token, "machineType": mtype,
+                             "machineCode": code,
+                             "vm": bool((data.get("vmInfo") or {}).get("isVm")),
+                             "source": "runtime-info"}
+        except Exception:
+            ident = {}
+    _native_ident_cache[realm] = (now, ident)
+    return ident
+
 # 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
 # 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
 CHECKIN_PROBE_TTL = 6 * 3600
@@ -315,6 +428,8 @@ class Account(object):
         self._checkin_cap_at = 0.0
         # 最近一次 campaign 平台状态快照（/sash/api/v1/me/campaigns）
         self.campaign_status = None
+        # 活动平台用的机器身份来源：native(官方原生桥) / derived(派生回退)
+        self.machine_identity_source = "derived"
 
     # -- 持久化 ------------------------------------------------------------
     def to_dict(self):
@@ -467,18 +582,28 @@ class Account(object):
           Cosy-Version: <桌面端版本>
           Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
           MachineType / MachineCode
-        缺这些头时服务端**不报错但返回空活动列表**（`showCampaign=false,
-        campaigns=[]`），这正是此前"签到不成功"的根因。
+
+        两层坑（都已踩过）：
+          1. 缺这些头 → 服务端不报错但返回**空活动列表**；
+          2. 机器身份用派生假值 → 列表里**静默少掉设备定向活动**
+             （"每日领取 100 Credits"），只有官方原生桥取到的真身份才完整。
+        因此这里优先用 runtime-info.exe 的真值，失败才回退稳定派生值。
         """
         h = dict(self.headers())
         h["User-Agent"] = "Qoder"
         h["cosy-clienttype"] = DESKTOP_CLIENT_TYPE
         h["cosy-version"] = desktop_version()
+        ident = native_machine_identity(self.realm, self.uid)
         h["cosy-machineid"] = derive_id(self.uid, "machine")
-        h["cosy-machinetoken"] = derive_machine_token(self.uid)
-        h["cosy-machinetype"] = derive_machine_type(self.uid)
+        h["cosy-machinetoken"] = ident.get("machineToken") or \
+            derive_machine_token(self.uid)
+        h["cosy-machinetype"] = ident.get("machineType") or \
+            derive_machine_type(self.uid)
+        h["cosy-machinecode"] = ident.get("machineCode") or \
+            derive_id(self.uid, "machinecode")
         h["cosy-machineos"] = MACHINE_OS
         h["cosy-machinehostname"] = MACHINE_HOSTNAME
+        self.machine_identity_source = ident.get("source") or "derived"
         return h
 
     # -- 刷新（按 token 前缀路由） ----------------------------------------
@@ -760,6 +885,8 @@ class Account(object):
             "claimable": bool(q.get("claimable")),
             "campaign_url": str(q.get("campaignUrl") or ""),
             "campaigns": items,
+            # 机器身份来源：derived 时设备定向活动可能被服务端过滤（列表偏少）
+            "identity": getattr(self, "machine_identity_source", "derived"),
         }
         self.campaign_status = st
         return st
