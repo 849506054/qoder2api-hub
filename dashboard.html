@@ -217,7 +217,13 @@ a:hover{text-decoration:underline}
 <body>
 <header>
   <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
-    <h1><span class="dot" id="statusDot"></span>Qoder 网关看板</h1>
+    <h1><span class="dot" id="statusDot"></span>Qoder 网关看板
+      <a id="updateBadge" href="#" target="_blank" rel="noopener"
+         style="display:none;margin-left:10px;font-size:12px;font-weight:600;vertical-align:middle;
+                background:rgba(56,189,248,.14);color:var(--accent);border:1px solid rgba(56,189,248,.4);
+                border-radius:999px;padding:2px 10px;text-decoration:none"
+         title="发现新版本，点击前往 Releases 升级"></a>
+    </h1>
     <nav class="main-nav">
       <button class="main-nav-btn active" id="btnNavGateway" onclick="switchMainTab('gateway')">
         网关与运维
@@ -916,6 +922,20 @@ function updateUI(){
 };
 
 // —— 项目新版本检测（运行信息卡片；自动检查一次 + 手动「立即检查」）——
+// 有新版本时同时在顶部标题旁亮出徽标（提醒升级），点击直达 Releases。
+function setUpdateBadge(r){
+  const badge = document.getElementById('updateBadge');
+  if(!badge) return;
+  if(r && r.has_update){
+    badge.textContent = '有新版本 ' + (r.latest || '') + ' → 升级';
+    badge.href = r.url || '#';
+    badge.style.display = 'inline-block';
+  } else {
+    badge.style.display = 'none';
+    badge.textContent = '';
+  }
+}
+
 async function loadUpdateState(force, btn){
   const state = document.getElementById('updateState');
   const actions = document.getElementById('updateActions');
@@ -929,6 +949,7 @@ async function loadUpdateState(force, btn){
     if(!r || r.ok === false){
       state.textContent = '检查失败（网络不可达或 GitHub 受限）';
       state.style.color = 'var(--warn)';
+      setUpdateBadge(null);
     } else if(r.has_update){
       state.innerHTML = '发现新版本 <b style="color:var(--accent)">' + esc(r.latest) + '</b>'
         + '（当前 ' + esc(r.current) + '）';
@@ -937,9 +958,11 @@ async function loadUpdateState(force, btn){
         actions.innerHTML = '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
           + 'style="color:var(--accent);text-decoration:underline">前往 Releases 下载升级 →</a>';
       }
+      setUpdateBadge(r);      // 顶部徽标提醒升级
     } else {
       state.textContent = '已是最新版本（' + esc(r.current) + (r.latest ? (' · 最新 ' + esc(r.latest)) : '') + '）';
       state.style.color = '#26bb82';
+      setUpdateBadge(null);
     }
   }catch(e){
     state.textContent = '检查失败：' + String((e && e.message) || e);
