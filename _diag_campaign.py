@@ -2,7 +2,8 @@
 """_diag_campaign.py —— 活动资格与新人权益自检（为什么我没有签到/新人活动）
 
 对账号池里的每个账号输出一份"权益体检"：
-  1. 机器身份来源（官方原生桥 runtime-info.exe / 派生回退）与 VM 检测结果
+  1. 机器身份来源（官方原生桥 runtime-info.exe / 派生回退）与 **本机虚拟化状态**
+     （中文：官方风控桥 vmInfo 判定 + 本机交叉校验证据 + VBS/HVCI 误报提示）
   2. 套餐与额度（plan / userType / 基础额度 / 资源包）
   3. 活动平台列表（每条活动的状态、奖励、成就要求、不可用原因）
   4. 成就列表（哪些任务已完成）
@@ -11,6 +12,7 @@
 只读：不领取任何活动。用法：
     python _diag_campaign.py            # 体检全部账号
     python _diag_campaign.py --uid XX   # 只看某个账号（uid 前缀匹配）
+    python _diag_campaign.py --no-local # 跳过本机虚拟化状态检查
 退出码：0=成功输出；1=无可用账号。
 """
 import argparse
@@ -44,53 +46,64 @@ RULES = """
 """
 
 
-import winreg
+if os.name == "nt":
+    import winreg      # 仅 Windows 有；非 Windows 走本机交叉校验的其他分支
 
 
-def local_virtualization_report():
-    """本机虚拟化状态：官方 runtime-info 的 isVm 在"开了 VBS/内核隔离的实体机"
-    上会误报为 VM（Windows 自身跑在 Hyper-V 之上，CPU 暴露 hypervisor 位）。"""
-    out = {}
-    try:
-        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                           r"SYSTEM\CurrentControlSet\Control\DeviceGuard")
-        out["VBS(基于虚拟化的安全)"] = winreg.QueryValueEx(k,
-                                                "EnableVirtualizationBasedSecurity")[0]
-    except Exception:
-        out["VBS(基于虚拟化的安全)"] = "?"
-    try:
-        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                           r"SYSTEM\CurrentControlSet\Control\DeviceGuard"
-                           r"\Scenarios\HypervisorEnforcedCodeIntegrity")
-        out["HVCI(内核隔离/内存完整性)"] = winreg.QueryValueEx(k, "Enabled")[0]
-    except Exception:
-        out["HVCI(内核隔离/内存完整性)"] = "?"
-    try:
-        import subprocess
-        raw = subprocess.run(["systeminfo"], capture_output=True,
-                             timeout=90).stdout
-        t = ""
-        for enc in ("utf-8", "gbk"):
-            t = raw.decode(enc, "replace")
-            if ("虚拟机监控程序" in t or "hypervisor" in t.lower()
-                    or "系统制造商" in t or "System Manufacturer" in t):
-                break
-        out["检测到hypervisor"] = ("是" if ("虚拟机监控程序" in t or
-                                        "hypervisor has been detected" in t.lower())
-                                  else "否")
-    except Exception:
-        out["检测到hypervisor"] = "?"
-    try:
-        import subprocess
-        cs = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance Win32_ComputerSystem).Manufacturer + ' / ' + "
-             "(Get-CimInstance Win32_ComputerSystem).Model"],
-            capture_output=True, text=True, timeout=60).stdout.strip()
-        out["硬件(厂商/型号)"] = cs or "?"
-    except Exception:
-        out["硬件(厂商/型号)"] = "?"
-    return out
+def local_virtualization_report(realm="cn"):
+    """本机虚拟化状态（中文）：官方风控桥判定 + 本机交叉校验 + VBS/HVCI 误报提示。
+
+    官方 `runtime-info.exe` 的 isVm 在"开了 VBS/内核隔离的实体机"上会误报为
+    虚拟机（Windows 自身跑在 Hyper-V 之上，CPU 暴露 hypervisor 位），因此这里
+    同时给出本机侧证据（CPU 型号 / 系统制造商 / 虚拟化驱动 / VBS / HVCI）供交叉
+    判断。返回 (官方+交叉校验结果, 本机开关项)。"""
+    st = A.local_vm_status(realm, force=True)
+    extra = {"VBS(基于虚拟化的安全)": "?", "HVCI(内核隔离/内存完整性)": "?"}
+    if os.name == "nt":
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"SYSTEM\CurrentControlSet\Control\DeviceGuard")
+            extra["VBS(基于虚拟化的安全)"] = winreg.QueryValueEx(
+                k, "EnableVirtualizationBasedSecurity")[0]
+        except Exception:
+            pass
+        try:
+            k = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Control\DeviceGuard"
+                r"\Scenarios\HypervisorEnforcedCodeIntegrity")
+            extra["HVCI(内核隔离/内存完整性)"] = winreg.QueryValueEx(k, "Enabled")[0]
+        except Exception:
+            pass
+    return st, extra
+
+
+def print_virtualization_status(realm="cn"):
+    """打印「本机虚拟化状态」体检段（中文）。"""
+    st, extra = local_virtualization_report(realm)
+    print("本机虚拟化状态（中文）")
+    print("  结论       : %s" % st["summary"])
+    print("  是否虚拟机 : %s     风险档位: %s     风控评分: %s"
+          % ("是" if st["is_vm"] else "否", st["level"],
+             st["score"] if st["score"] is not None else "-"))
+    print("  虚拟化平台 : %s%s" % (st["brand_cn"] or "-",
+          ("（类型码 %s）" % st["vm_type_code"])
+          if st["vm_type_code"] is not None else ""))
+    print("  判定来源   : %s" % (
+        "官方风控桥 runtime-info.exe（官方客户端同源）" if st["source"] == "runtime-info"
+        else "本机交叉校验（风控桥不可用）"))
+    print("  检测证据   :")
+    for e in st["evidence"]:
+        print("    · %s" % e)
+    for k, v in extra.items():
+        print("    · %s = %s" % (k, v))
+    if st["is_vm"]:
+        print("  提示       : 官方风控把虚拟化环境计入风险画像（评分越高越保守）；"
+              "新人试用类活动明确不面向虚拟机。")
+        print("               注意 isVm 在「开了 VBS/内核隔离的实体机」上会误报——"
+              "若上表 VBS=1 且无虚拟化驱动，多为误报。")
+    print("  看板同源   : 「签到与福利中心 · 本机虚拟化检测」卡片 / GET /diag/vm")
+    print()
 
 
 def identity_report(realm, account_id):
@@ -109,15 +122,13 @@ def main():
     ap.add_argument("--no-local", action="store_true",
                     help="跳过本机虚拟化状态检查")
     args = ap.parse_args()
-    if not args.no_local:
-        print("本机虚拟化状态（isVm 误报常见于开了 VBS/内核隔离的实体机）：")
-        for k, v in local_virtualization_report().items():
-            print("   %s = %s" % (k, v))
-        print()
     pool = A.AccountPool(os.environ["ACCOUNTS_DIR"], log=lambda m: None)
     pool.load()
     accs = [a for a in pool.accounts
             if not args.uid or a.uid.startswith(args.uid)]
+    if not args.no_local:
+        # 本机虚拟化状态（与看板「本机虚拟化检测」同源）
+        print_virtualization_status(accs[0].realm if accs else "cn")
     if not accs:
         print("没有可用账号（accounts 目录为空或未匹配）")
         return 1

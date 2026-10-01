@@ -28,7 +28,8 @@ from pathlib import Path
 import uuid
 
 from qoder_fingerprint import (derive_id, generate_request_id,
-                               derive_machine_token, derive_machine_type)
+                               derive_machine_token, derive_machine_type,
+                               vm_status)
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -197,6 +198,53 @@ def runtime_info_exe(realm):
     return found
 
 
+def run_runtime_info(realm, account_id=""):
+    """调用官方 runtime-info.exe，返回其 JSON（失败返回 {}）。
+
+    account 为空串同样可用：机器身份是机器级的，活动平台之外（如虚拟化体检）
+    不需要账号上下文。
+    """
+    exe = runtime_info_exe(realm)
+    if not exe:
+        return {}
+    try:
+        import subprocess
+        proc = subprocess.run(
+            [exe, "prod", "--account-stdin"],
+            input=json.dumps({"account": account_id or ""}).encode("utf-8") + b" ",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25,
+            cwd=os.path.dirname(exe))
+        out = proc.stdout.decode("utf-8", "replace").strip()
+        if out:
+            return json.loads(out.split("\n", 1)[0])
+    except Exception:
+        pass
+    return {}
+
+
+_vm_cache = {}
+
+
+def local_vm_status(realm=None, force=False):
+    """本机虚拟化状态（**中文输出**）：看板与 _diag_campaign.py 共用。
+
+    优先用官方风控桥的 vmInfo（官方客户端就是这么判的），桥不可用时退化为
+    本机交叉校验（CPU 型号 / 系统制造商 / 虚拟化驱动文件）。结果缓存 300s。
+    """
+    r = realm if realm in ("cn", "intl") else "cn"
+    now = time.time()
+    hit = _vm_cache.get(r)
+    if hit and not force and now - hit[0] < 300:
+        return hit[1]
+    data = run_runtime_info(r)
+    vm_info = data.get("vmInfo") if isinstance(data.get("vmInfo"), dict) else {}
+    st = vm_status(bridge_vm_info=vm_info, bridge_available=bool(runtime_info_exe(r)))
+    st["realm"] = r
+    st["bridge_available"] = bool(runtime_info_exe(r))
+    _vm_cache[r] = (now, st)
+    return st
+
+
 def native_machine_identity(realm, account_id, force=False):
     """调用官方原生桥取真实机器身份；任何失败返回 {}（调用方回退派生值）。
 
@@ -210,28 +258,18 @@ def native_machine_identity(realm, account_id, force=False):
         if hit and now - hit[0] < NATIVE_IDENTITY_TTL:
             return hit[1]
     ident = {}
-    exe = runtime_info_exe(realm)
-    if exe and account_id:
-        try:
-            import subprocess
-            proc = subprocess.run(
-                [exe, "prod", "--account-stdin"],
-                input=json.dumps({"account": account_id}).encode("utf-8") + b" ",
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25,
-                cwd=os.path.dirname(exe))
-            out = proc.stdout.decode("utf-8", "replace").strip()
-            if out:
-                data = json.loads(out.split("\n", 1)[0])
-                token = str(data.get("machineToken") or "").strip()
-                mtype = str(data.get("machineType") or "").strip()
-                code = str(data.get("machineCode") or "").strip()
-                if token and mtype and code:
-                    ident = {"machineToken": token, "machineType": mtype,
-                             "machineCode": code,
-                             "vm": bool((data.get("vmInfo") or {}).get("isVm")),
-                             "source": "runtime-info"}
-        except Exception:
-            ident = {}
+    data = run_runtime_info(realm, account_id)
+    if data:
+        token = str(data.get("machineToken") or "").strip()
+        mtype = str(data.get("machineType") or "").strip()
+        code = str(data.get("machineCode") or "").strip()
+        vm_info = data.get("vmInfo") if isinstance(data.get("vmInfo"), dict) else {}
+        if token and mtype and code:
+            ident = {"machineToken": token, "machineType": mtype,
+                     "machineCode": code,
+                     "vm": bool(vm_info.get("isVm")),
+                     "vm_info": vm_info,
+                     "source": "runtime-info"}
     _native_ident_cache[realm] = (now, ident)
     return ident
 

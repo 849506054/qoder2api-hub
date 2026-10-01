@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.1.3-2496ED?style=flat-square" alt="Version 1.1.3">
+  <img src="https://img.shields.io/badge/Release-v1.1.4-2496ED?style=flat-square" alt="Version 1.1.4">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -57,6 +57,7 @@
 > ⚠️ **"客户端一直显示工作中、一个字都不吐，网关日志也毫无变化"** → 九成是**网关没在跑**：请求根本没到达，所以日志自然一动不动。一条命令确诊：
 > ```bash
 > python _diag_gateway.py --chat   # 端口 → /ping → /health → /v1/models → 真实流式，逐项报出断在哪
+> python _diag_campaign.py         # 签到/活动链路体检（含本机虚拟化状态，中文输出）
 > ```
 > - **生命周期就是那个 cmd 窗口**（刻意的设计）：窗口开着网关就活着，**关掉窗口网关即停**，不会有后台残留进程；下次要用重新双击 `start-qoder-proxy.bat` 即可。
 > - 判别口诀：日志时间戳停在某一刻、此后再无 `POST /v1/chat/completions` = 网关已停；重新双击启动脚本即可恢复。
@@ -322,7 +323,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 ## 六、开发与测试
 
 ```bash
-# 离线确定性测试（294 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
+# 离线确定性测试（342 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
 # 自定义 B64、COSY 签名、双区官方目录全字段（峰谷价/多窗口/思考档位/展示 id/解析）、
 # 独占路由、签到能力运行时探测与 DISABLED 归一化、活动平台归一化、DeepSeek
 # reasoning_content 回填与 flatten 保留、请求体、信封解包、custom 工具转译、
@@ -331,6 +332,10 @@ python _test_qoder.py
 
 # 直接启动
 python qoder_proxy.py --port 8790
+
+# 签到/活动链路体检（含**本机虚拟化状态**：官方风控桥 vmInfo + 本机交叉校验，中文输出；
+# 只读；--uid 只看某账号；--no-local 跳过虚拟化检查）
+python _diag_campaign.py
 
 # 客户端更新后刷新官方模型快照（解密本机客户端目录缓存 → 双区 JSON 快照，
 # 并打印价格/上下文/思考档位的变化摘要；--dry-run 只看差异不写文件）
@@ -357,13 +362,25 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `qoder_settings.py` | 面板密码 (PBKDF2)、多 API Key 出口绑定、会话管理 |
 | `qoder_fingerprint.py` | UID 稳定设备指纹派生 (derive_id) |
 | `baseprompt.json` | 官方推理请求体模板 |
-| `dashboard.html` | 单文件 Web 看板（本地凭证两步扫描导入 + PAT 导入） |
+| `dashboard.html` | 单文件 Web 看板（本地凭证两步扫描导入 + PAT 导入 + 签到中心的**本机虚拟化检测**卡片） |
+| `_diag_campaign.py` | 签到/活动链路体检（含本机虚拟化状态，中文输出） |
 
 ---
 
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.1.4
+
+**新增**
+- `_diag_campaign.py` 增加**本机虚拟化状态**体检：官方风控桥 vmInfo（是否虚拟机/平台/风险评分/类型码）+ 本机交叉校验（CPU 型号、系统制造商、虚拟化驱动、VBS/HVCI），全中文输出并附误报提示。
+- 看板「签到与福利中心」新增**本机虚拟化检测**卡片（同源，可「重新检测」）；新增 `GET /diag/vm` 接口（面板鉴权）。
+
+**修复**
+- `/diag/*` 路由纳入面板鉴权（此前未带令牌也能读取）。
+
+### v1.1.3
 
 ### v1.1.3
 

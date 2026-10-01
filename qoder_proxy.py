@@ -48,10 +48,11 @@ import qoder_catalog
 import qoder_settings
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
-from qoder_accounts import get_realm_config, gateway_candidates, CLIENT_UA
+from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
+                            local_vm_status)
 from pathlib import Path
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4130,6 +4131,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/logs"):
             return True
+        if path.startswith("/diag"):
+            return True
         return False
 
     def do_OPTIONS(self):
@@ -4174,6 +4177,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             return self.wfile.write(body)
+        if path == "/diag/vm":
+            # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
+            # 以官方风控桥 runtime-info.exe 的 vmInfo 为准，桥不可用时本机交叉校验。
+            _q = parse_qs(urlparse(self.path).query)
+            try:
+                return self._json(200, local_vm_status(
+                    _q.get("realm", [None])[0] or CURRENT_REALM,
+                    force=bool(_q.get("force", [None])[0])))
+            except Exception as exc:
+                return self._error(500, "vm status failed: %s" % exc)
         if path == "/health":
             rep = current_account()
             info = {

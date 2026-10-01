@@ -1817,5 +1817,61 @@ check("unsupported effort on a level-less model is dropped from the body",
       _body_off.get("parameters"))
 
 print()
+print("[21] 本机虚拟化检测（中文输出：官方风控桥 vmInfo + 本机交叉校验）")
+import qoder_fingerprint as F
+
+check("vm_brand_cn: 已知平台译中文，未知品牌原样",
+      F.vm_brand_cn("Hyper-V") == "Hyper-V（微软）"
+      and F.vm_brand_cn("VMware, Inc.") == "VMware"
+      and F.vm_brand_cn("SomeVendor") == "SomeVendor"
+      and F.vm_brand_cn("") == "")
+check("风控评分 -> 中文档位（高/中/低/无/未知）",
+      [F._vm_level_cn(x) for x in (77, 50, 10, 0, None)]
+      == ["高", "中", "低", "无", "未知"])
+
+# 有官方风控结果：以它为权威
+_st_vm = F.vm_status(bridge_vm_info={"isVm": True, "brand": "Hyper-V",
+                                     "percentage": 77, "vmTypeCode": 14},
+                     bridge_available=True)
+check("bridge data wins: is_vm/level/score/brand_cn/source",
+      _st_vm["is_vm"] is True and _st_vm["level"] == "高"
+      and _st_vm["score"] == 77 and _st_vm["brand_cn"] == "Hyper-V（微软）"
+      and _st_vm["vm_type_code"] == 14 and _st_vm["source"] == "runtime-info",
+      _st_vm)
+check("中文结论包含平台与评分",
+      "本机运行在虚拟机中" in _st_vm["summary"]
+      and "Hyper-V（微软）" in _st_vm["summary"] and "77" in _st_vm["summary"],
+      _st_vm["summary"])
+check("证据首条为官方风控判定（中文）",
+      _st_vm["evidence"] and "官方风控判定" in _st_vm["evidence"][0],
+      _st_vm["evidence"][:1])
+
+# 无官方结果：退化为本机交叉校验，结论里明确说明
+_st_local = F.vm_status(bridge_vm_info=None, bridge_available=False)
+check("no bridge -> local cross-check + 中文说明",
+      _st_local["source"] == "local" and isinstance(_st_local["is_vm"], bool)
+      and "本机交叉校验" in _st_local["summary"], _st_local["summary"])
+
+# 看板契约：这些键必须都在（前端 /diag/vm 直接消费）
+check("dashboard contract keys present",
+      set(("is_vm", "level", "score", "brand", "brand_cn", "vm_type_code",
+           "source", "evidence", "summary")) <= set(_st_vm.keys()),
+      sorted(_st_vm.keys()))
+_st_api = A.local_vm_status("cn", force=True)
+check("A.local_vm_status adds realm + bridge_available",
+      _st_api.get("realm") in ("cn", "intl")
+      and isinstance(_st_api.get("bridge_available"), bool), 
+      (A.local_vm_status("cn") is not None, _st_api.get("bridge_available")))
+
+# /diag/* 必须走面板鉴权（此前漏加会被无鉴权读取）
+_src21 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "qoder_proxy.py"), encoding="utf-8").read()
+check("/diag routes are panel-guarded",
+      'if path.startswith("/diag"):' in _src21
+      and _src21.find('if path.startswith("/diag"):')
+      < _src21.find('return False', _src21.find('def _is_panel_route')),
+      "guard missing" if 'if path.startswith("/diag"):' not in _src21 else "")
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
