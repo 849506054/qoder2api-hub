@@ -546,6 +546,10 @@ a:hover{text-decoration:underline}
       <table>
         <tbody>
           <tr><td>当前版本</td><td class="mono" id="setVersion">-</td></tr>
+          <tr><td>新版本检测</td>
+              <td><span id="updateState" style="color:var(--dim)">尚未检查</span>
+                  <span id="updateActions" style="margin-left:8px"></span>
+              </td></tr>
           <tr><td>账号存储目录</td><td class="mono" id="setAccountsDir">-</td></tr>
           <tr><td>用量日志目录</td><td class="mono" id="setUsageDir">-</td></tr>
           <tr><td>设置文件</td><td class="mono" id="setFile">-</td></tr>
@@ -911,17 +915,60 @@ function updateUI(){
   if(elCnAcct) elCnAcct.textContent = cnAccts.length;
 };
 
+// —— 项目新版本检测（运行信息卡片；自动检查一次 + 手动「立即检查」）——
+async function loadUpdateState(force, btn){
+  const state = document.getElementById('updateState');
+  const actions = document.getElementById('updateActions');
+  if(!state) return;
+  if(btn){ btn.disabled = true; btn.textContent = '检查中...'; }
+  state.textContent = '正在检查…';
+  state.style.color = 'var(--dim)';
+  if(actions) actions.innerHTML = '';
+  try{
+    const r = await getJSON('/update/check' + (force ? '?force=1' : ''));
+    if(!r || r.ok === false){
+      state.textContent = '检查失败（网络不可达或 GitHub 受限）';
+      state.style.color = 'var(--warn)';
+    } else if(r.has_update){
+      state.innerHTML = '发现新版本 <b style="color:var(--accent)">' + esc(r.latest) + '</b>'
+        + '（当前 ' + esc(r.current) + '）';
+      state.style.color = 'var(--accent)';
+      if(actions && r.url){
+        actions.innerHTML = '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
+          + 'style="color:var(--accent);text-decoration:underline">前往 Releases 下载升级 →</a>';
+      }
+    } else {
+      state.textContent = '已是最新版本（' + esc(r.current) + (r.latest ? (' · 最新 ' + esc(r.latest)) : '') + '）';
+      state.style.color = '#26bb82';
+    }
+  }catch(e){
+    state.textContent = '检查失败：' + String((e && e.message) || e);
+    state.style.color = 'var(--warn)';
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '立即检查'; }
+    else if(actions && !actions.innerHTML){
+      actions.innerHTML = '<button class="sec" style="font-size:11px;padding:3px 8px" '
+        + 'onclick="loadUpdateState(true, this)">立即检查</button>';
+    }
+  }
+}
+
 async function switchViewRealm(r){
   if(window.VIEW_REALM === r) return;
   window.VIEW_REALM = r;
   RECENT_PAGE = 1;
+  CURRENT_GROWTH_UID = 'all';   // 账号选择跨区域无意义：回到本区域批量
   window.updateUI();
-  await loadAccounts();
-  await loadModels();
-  await loadGrowthTasks();
-  await loadSchedulerStatus();
-  await loadAnalytics();
-  await refresh();
+  // 并行刷新：此前是 6 个请求串行 await（每个都要打上游），切一次视图要等好几秒。
+  // 模型库/成长任务还会先用"本区域缓存"即时渲染，随后由各自的后台刷新覆盖。
+  await Promise.all([
+    loadAccounts(),
+    loadModels(),
+    loadGrowthTasks(),
+    loadSchedulerStatus(),
+    loadAnalytics(),
+    refresh(),
+  ]);
 };
 
 async function toggleActiveGatewayRealm(){
@@ -940,24 +987,44 @@ async function toggleActiveGatewayRealm(){
   }
 };
 
-async function initRealm(){
-  try {
+async function initRealm(preserveView){
+  try{
     const r = await getJSON("/realm");
     if(r && r.current) window.ACTIVE_GATEWAY_REALM = r.current;
   } catch(e){}
-  window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
-  const viewFromUrl = new URLSearchParams(window.location.search).get('view');
-  if(viewFromUrl && ['intl', 'cn'].includes(viewFromUrl)) window.VIEW_REALM = viewFromUrl;
-  const limitFromUrl = new URLSearchParams(window.location.search).get('limit');
-  if(limitFromUrl && [10, 20, 50, 100].includes(parseInt(limitFromUrl, 10))) RECENT_LIMIT = parseInt(limitFromUrl, 10);
+  // preserveView=true：只同步"网关默认出口"，**不动用户当前正在看的视图**
+  // （此前 doCheckin 等动作后会调用本函数，导致视图被重置回网关默认区，
+  //  表现就是"签完到跳回国际版视图"）
+  if(!preserveView){
+    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
+    const viewFromUrl = new URLSearchParams(window.location.search).get('view');
+    if(viewFromUrl && ['intl', 'cn'].includes(viewFromUrl)) window.VIEW_REALM = viewFromUrl;
+    const limitFromUrl = new URLSearchParams(window.location.search).get('limit');
+    if(limitFromUrl && [10, 20, 50, 100].includes(parseInt(limitFromUrl, 10))) RECENT_LIMIT = parseInt(limitFromUrl, 10);
+  }
   window.updateUI();
 }
 
+// 按区域缓存最近一次数据：切视图时先即时渲染缓存，再后台刷新（SWR），
+// 避免"点了国内版要等好几秒才刷出来"。
+const MODELS_CACHE = {};    // realm -> data[]
+const GROWTH_CACHE = {};    // realm|uid -> /tasks 响应（含 __at 时间戳）
+
 async function loadModels(){
-  try{
-    const r = await getJSON('/v1/models?realm=' + encodeURIComponent(window.VIEW_REALM));
-    MODELS_DATA = r.data || [];
+  const realm = window.VIEW_REALM || "intl";
+  const hit = MODELS_CACHE[realm];
+  if(hit){                       // 1) 立即用缓存渲染
+    MODELS_DATA = hit;
     renderAvailableModels();
+  }
+  try{
+    const r = await getJSON('/v1/models?realm=' + encodeURIComponent(realm));
+    // 2) 后台刷新；仅当用户仍停留在同一区域时覆盖界面
+    MODELS_CACHE[realm] = r.data || [];
+    if((window.VIEW_REALM || "intl") === realm){
+      MODELS_DATA = MODELS_CACHE[realm];
+      renderAvailableModels();
+    }
   }catch(e){
     console.error('loadModels error:', e);
   }
@@ -1160,9 +1227,18 @@ async function loadVmState(force){
     const card = document.getElementById("cardVmState");
     if(card) card.title = r.summary || '';
   }catch(e){
-    el.textContent = '检测失败';
+    const msg = String((e && e.message) || e);
     const ev = document.getElementById("vmEvidence");
-    if(ev) ev.textContent = String((e && e.message) || e);
+    if(msg === '404'){
+      // 旧网关进程没有 /diag/vm 路由（v1.1.4 起才有）
+      el.innerHTML = '<span style="color:var(--warn)">需重启网关</span>';
+      const desc = document.getElementById("vmDesc");
+      if(desc) desc.textContent = '本机虚拟化检测（当前网关进程版本较旧）';
+      if(ev) ev.textContent = '该功能需要 v1.1.4+ 的网关进程：重启网关后点「重新检测」。';
+    } else {
+      el.textContent = '检测失败';
+      if(ev) ev.textContent = msg;
+    }
   }
 }
 function refreshVmState(btn){
@@ -1172,15 +1248,35 @@ function refreshVmState(btn){
   });
 }
 
-async function loadGrowthTasks(){
+async function loadGrowthTasks(opts){
   const sec = document.getElementById("sectionGrowthTasks");
   if(!sec) return;
   // 双区域都展示：签到能力由后端运行时探测，接口不存在时任务行会给出原因
   sec.style.display = 'block';
-  loadVmState();
+  const realm = window.VIEW_REALM || "intl";
+  const uid = (CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all') ? CURRENT_GROWTH_UID : '';
+  const key = realm + '|' + uid;
+  const hit = GROWTH_CACHE[key];
+  if(hit) renderGrowthTasks(hit);          // 1) 缓存即时渲染（切视图/账号秒开）
+  if(hit && (Date.now() - (hit.__at || 0)) < 15000 && !(opts && opts.force)) return;
   try{
-    const q = (CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all') ? ('?uid=' + encodeURIComponent(CURRENT_GROWTH_UID)) : '';
+    // 账号池与积分按视图分区：请求带上当前区域，后端只列该区域账号
+    const q = '?realm=' + encodeURIComponent(realm)
+            + (uid ? ('&uid=' + encodeURIComponent(uid)) : '');
     const r = await getJSON('/tasks' + q);
+    r.__at = Date.now();
+    GROWTH_CACHE[key] = r;
+    if(((window.VIEW_REALM || "intl") === realm)
+       && ((CURRENT_GROWTH_UID || 'all') === (uid || 'all'))){
+      renderGrowthTasks(r);                // 2) 后台结果到达后覆盖
+      loadVmState();
+    }
+  }catch(e){
+    console.error('loadGrowthTasks error:', e);
+  }
+}
+
+function renderGrowthTasks(r){
     const tasks = r.tasks || [];
     const sum = r.summary || {};
     const accts = r.accounts || [];
@@ -1190,7 +1286,7 @@ async function loadGrowthTasks(){
 
     const sel = document.getElementById("growthAcctSelect");
     if(sel && accts.length){
-      const opts = ['<option value="all"' + (CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>全部账号 (批量)</option>']
+      const opts = ['<option value="all"' + (!CURRENT_GROWTH_UID || CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>全部账号 (本区域批量)</option>']
         .concat(accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(a.nickname) + ' (' + esc(a.uid.slice(0,6)) + ' · ' + (a.realm === 'intl' ? '国际版' : '国内版') + ')</option>'))
         .join('');
       sel.innerHTML = opts;
@@ -1247,9 +1343,6 @@ async function loadGrowthTasks(){
         + '<td>' + stBadge + '</td>'
         + '</tr>';
     }).join('');
-  }catch(e){
-    console.error('loadGrowthTasks error:', e);
-  }
 }
 
 async function runGrowthTasks(btn){
@@ -1272,8 +1365,7 @@ async function runGrowthTasks(btn){
       logBox.innerHTML = logs.map(l => '<div>' + esc(l) + '</div>').join('');
       logBox.scrollTop = logBox.scrollHeight;
     }
-    await loadAccounts();
-    await loadGrowthTasks();
+    await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
     const sumC = r.credit_added != null ? ('，共增加 +' + r.credit_added + ' 积分') : '';
     toast("签到流水执行完成" + sumC + "！");
   }catch(e){
@@ -1294,8 +1386,7 @@ async function triggerCatTravel(btn){
     }
     const r = await postJSON("/tasks/travel", payload);
     toast(r.msg || (r.ok ? "福利包领取完成" : "操作失败"), r.ok ? "ok" : "warn");
-    await loadAccounts();
-    await loadGrowthTasks();
+    await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
   }catch(e){
     toast("福利包领取失败: " + e.message, "bad");
   }finally{
@@ -1367,7 +1458,8 @@ async function doCheckin(btn){
       const summary = res.map(x => (x.nickname||x.uid.slice(0,6)) + ": " + (x.ok ? "签到成功" : (x.error||x.msg))).join("；");
       toast("每日签到: " + summary, res.some(x => x.ok) ? "ok" : "warn");
     }
-    await initRealm(); loadAccounts(); loadModels();
+    await initRealm(true);      // 保留当前视图（不再跳回网关默认区）
+    await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);
   }catch(e){ toast("签到失败: " + e.message, "bad"); }
   finally { btn.disabled = false; btn.textContent = ot; }
 }
@@ -2390,6 +2482,7 @@ async function startDashboard(){
   if(PANEL_READY) return;
   PANEL_READY = true;
   await loadSettings();
+  loadUpdateState();          // 自动检查新版本（不阻塞首屏，失败静默）
   await initRealm();
   await loadAccounts();
   await loadModels();

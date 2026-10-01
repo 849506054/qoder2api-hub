@@ -79,6 +79,8 @@ REALM_CONFIGS = {
 
 CLIENT_UA = "Go-http-client/2.0"
 LOGIN_TTL_SECONDS = 600
+# 账号文件写入锁（/tasks 并行刷新时多个字段各自 save，必须串行落盘）
+_SAVE_LOCK = threading.Lock()
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 # 业务端点（全部挂 openapi 基址，纯 Bearer，无 COSY 签名）
@@ -126,11 +128,12 @@ def desktop_version():
 # 服务端**按这些值过滤设备定向活动**：派生的假身份不会报错，但活动列表里
 # 会静默少掉"每日领取 100 Credits"这类条目（实测：换用原生身份后立刻出现
 # CLAIMABLE 活动）。因此网关优先调用同一个官方二进制取真值，失败才回退派生值。
-# 原生身份缓存：**身份会轮换**（实测十几分钟内 token/type/code 就变了），
-# 所以只做短缓存，并在"列表显示活动被过滤"时强制刷新重试一次。
+# 原生身份缓存：身份会随时间轮换，但**旧身份仍被服务端接受**（实测复用 25s+
+# 依然 showCampaign=true），真正的成本是每次强制刷新要跑 3.7 秒的官方二进制。
+# 因此做长缓存（30 分钟），并用"列表被判为未认可时刷新重试一次"兜底自愈。
 # 注意：身份是**机器级**的（不同账号/不存在的账号 id 都返回同一份），
 # 因此按区域缓存即可，同一台机器上的多个账号共用是正确的。
-NATIVE_IDENTITY_TTL = 120
+NATIVE_IDENTITY_TTL = 1800
 _native_exe_cache = {}
 _native_ident_cache = {}
 
@@ -276,6 +279,9 @@ def native_machine_identity(realm, account_id, force=False):
 # 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
 # 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
 CHECKIN_PROBE_TTL = 6 * 3600
+# 活动列表缓存 TTL：活动状态变化很慢（每日一轮），20 秒内复用可让看板切换视图
+# /账号不再等那 1–4 秒的上游请求；领取动作会强制绕过并立即失效缓存。
+CAMPAIGNS_TTL = 20
 CHECKIN_REASON_NOT_FOUND = "checkin_endpoint_not_found"
 
 # 会话死亡标记：上游主动吊销离线会话，刷新已无意义，需要重新登录。
@@ -473,6 +479,9 @@ class Account(object):
         self._checkin_cap_at = 0.0
         # 最近一次 campaign 平台状态快照（/sash/api/v1/me/campaigns）
         self.campaign_status = None
+        # 活动列表短缓存 (at, payload)：该请求约 1–4 秒（上游最慢的一环），
+        # 看板切换视图/账号会连续取，缓存后由"领取动作"显式失效。
+        self._campaigns_cache = None
         # 活动平台用的机器身份来源：native(官方原生桥) / derived(派生回退)
         self.machine_identity_source = "derived"
 
@@ -544,12 +553,14 @@ class Account(object):
         tmp = base / (name + ".tmp")
         if not (path.is_relative_to(base) and tmp.is_relative_to(base)):
             raise ValueError("invalid path for account save")
-        tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, path)
+        # 并发保护：/tasks 面板接口会并行刷新同一账号的多个字段（credits/plan/…），
+        # 每个都可能触发 save；同一 tmp 路径被两个线程同时写会落出坏 JSON。
+        with _SAVE_LOCK:
+            tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, path)
         self.path = str(path)
         return self.path
-
     def delete(self):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
@@ -891,7 +902,7 @@ class Account(object):
         except Exception as exc:
             return None, 0, str(exc)
 
-    def campaigns(self):
+    def campaigns(self, force=False):
         """GET /sash/api/v1/me/campaigns -> 官方活动平台状态（双区域通用）。
 
         官方把"每日领取 100 Credits"等限时活动搬到了 campaign 平台，取列表要
@@ -901,10 +912,16 @@ class Account(object):
 
         机器身份会轮换：若本次 `showCampaign=false`（通常意味着身份被判定为
         非官方客户端），强制刷新一次身份并重试，避免缓存过期导致整天领不到。
+        结果短缓存 CAMPAIGNS_TTL 秒（force=True 绕过）——该请求是上游最慢的
+        一环，看板切换视图时不该重复等它。
 
         返回 {ok, available, show_campaign, claimable, campaign_url, campaigns,
               identity}，每条活动含 action_type / claim_status / benefit / end_at。
         """
+        now = time.time()
+        if not force and self._campaigns_cache \
+                and now - self._campaigns_cache[0] < CAMPAIGNS_TTL:
+            return self._campaigns_cache[1]
         q, code, err = self._campaigns_get()
         if isinstance(q, dict) and not q.get("showCampaign") \
                 and getattr(self, "machine_identity_source", "") == "native":
@@ -950,6 +967,7 @@ class Account(object):
             "identity": getattr(self, "machine_identity_source", "derived"),
         }
         self.campaign_status = st
+        self._campaigns_cache = (time.time(), st)
         return st
 
     def campaign_reward(self, campaign_id):
@@ -1029,7 +1047,7 @@ class Account(object):
           - 无可领取项且没有任何活动 -> ok=True + message 说明
         """
         native_machine_identity(self.realm, self.uid, force=True)
-        st = self.campaigns()
+        st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
         if not st.get("ok"):
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
                     "earned": 0, "claimed": [], "already": [], "blocked": []}
@@ -1073,6 +1091,8 @@ class Account(object):
             msg = "活动领取失败：%s" % "; ".join(errors)[:200]
         else:
             msg = "当前账号暂无可领取的官方活动"
+        # 领取动作会改变活动状态：让下一次列表查询重新拉取（不吃 20s 缓存）
+        self._campaigns_cache = None
         return {"ok": not errors, "claimed": claimed, "already": already,
                 "blocked": blocked, "earned": earned, "message": msg,
                 "campaigns": st["campaigns"], "errors": errors}

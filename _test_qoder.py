@@ -988,7 +988,7 @@ def fake_campaigns_404(url, **kw):
 
 
 _A.http_json = fake_campaigns_404
-camp404 = _acc_camp.campaigns()
+camp404 = _acc_camp.campaigns(force=True)   # 绕过 20s 短缓存，验证真实请求路径
 _A.http_json = _orig_hj
 check("campaigns 404 -> ok False + available False (no crash)",
       camp404["ok"] is False and camp404["available"] is False, camp404)
@@ -1481,7 +1481,7 @@ _A_CAMPAIGNS = {
                           "achievement_completed": False, "unavailable_reason": "",
                           "placements": []}]},
 }
-A.Account.campaigns = lambda self: dict(_A_CAMPAIGNS[self.realm])
+A.Account.campaigns = lambda self, force=False: dict(_A_CAMPAIGNS[self.realm])
 A.Account.fetch_credits = lambda self: {"ok": True, "credits": {}}
 A.Account.fetch_plan = lambda self: ""
 A.Account.pro_eligibility = lambda self: (True, False)
@@ -1618,7 +1618,7 @@ def _stub_claim(self, campaign_id):
 
 
 A.Account.claim_campaign = _stub_claim
-A.Account.campaigns = lambda self: {
+A.Account.campaigns = lambda self, force=False: {
     "ok": True, "available": True, "show_campaign": True, "claimable": True,
     "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
     "campaigns": [
@@ -1654,7 +1654,7 @@ check("campaign_checkin message names the claimed campaign",
       "act-daily-100" in _res20["message"], _res20["message"])
 
 # --- 20.3 幂等：上游 replayed=true 视为已领取而不是新领取 ---
-A.Account.campaigns = lambda self: {
+A.Account.campaigns = lambda self, force=False: {
     "ok": True, "available": True, "show_campaign": True, "claimable": True,
     "campaign_url": "", "campaigns": [
         {"campaign_id": "c9", "campaign_key": "act-x",
@@ -1693,7 +1693,7 @@ check("claim_campaign parses BLOCKED/SAME_PERSON as blocked (not ok)",
 check("blocked claim keeps the benefit amount for reporting",
       _res_blk["amount"] == 100, _res_blk.get("amount"))
 
-A.Account.campaigns = lambda self: {
+A.Account.campaigns = lambda self, force=False: {
     "ok": True, "available": True, "show_campaign": True, "claimable": True,
     "campaign_url": "", "campaigns": [
         {"campaign_id": "cb", "campaign_key": "act-daily",
@@ -1913,6 +1913,121 @@ check("/diag routes are panel-guarded",
       and _src21.find('if path.startswith("/diag"):')
       < _src21.find('return False', _src21.find('def _is_panel_route')),
       "guard missing" if 'if path.startswith("/diag"):' not in _src21 else "")
+
+print()
+print("[22] 面板加速（短缓存 / 区域分区）与新版本检测")
+check("version_tuple 容忍 v 前缀与不足位数",
+      P.version_tuple("v1.2.3") == (1, 2, 3)
+      and P.version_tuple("1.1") == (1, 1, 0)
+      and P.version_tuple("") == (0, 0, 0))
+check("新版本比较：更高/相同/更低",
+      P.version_tuple("v1.2.0") > P.version_tuple("1.1.4")
+      and P.version_tuple("v1.1.4") == P.version_tuple("1.1.4")
+      and P.version_tuple("1.0.9") < P.version_tuple("1.1.0"))
+
+_orig_urlopen_u = P.urllib.request.urlopen
+
+
+class _UpdResp(object):
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode()
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_release(tag):
+    return {"tag_name": tag, "html_url": "https://example.invalid/rel/" + tag,
+            "published_at": "2026-10-01T00:00:00Z", "name": "rel " + tag}
+
+
+P.urllib.request.urlopen = lambda req, timeout=None: _UpdResp(_fake_release("v9.9.9"))
+_up_new = P.check_for_update(force=True)
+P.urllib.request.urlopen = lambda req, timeout=None: _UpdResp(_fake_release("v" + P.VERSION))
+_up_same = P.check_for_update(force=True)
+
+
+def _boom(req, timeout=None):
+    raise OSError("network down")
+
+
+P.urllib.request.urlopen = _boom
+_up_err = P.check_for_update(force=True)
+P.urllib.request.urlopen = _orig_urlopen_u
+check("check_for_update: 检测到更高版本 -> has_update",
+      _up_new["ok"] and _up_new["has_update"] and _up_new["latest"] == "v9.9.9", _up_new)
+check("check_for_update: 同版本 -> 无更新", _up_same["ok"] and not _up_same["has_update"])
+check("check_for_update: 网络失败 -> ok=False + error（不误报有更新）",
+      _up_err["ok"] is False and bool(_up_err["error"])
+      and not _up_err["has_update"], _up_err)
+_src22 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("/update 路由纳入面板鉴权",
+      'if path.startswith("/update"):' in _src22)
+check("/tasks 支持 ?realm= 区域过滤（账号池分区）",
+      'view = qoder_tasks.fetch_tasks_view(POOL, realm=realm_q, uid=uid)' in _src22)
+
+T.invalidate_panel_cache()
+_hits22 = {"campaigns": 0}
+
+
+class _Acc22(object):
+    uid = "cache22"
+    realm = "cn"
+
+    def campaigns(self, force=False):
+        _hits22["campaigns"] += 1
+        return {"ok": True, "available": True, "show_campaign": True,
+                "claimable": False, "campaign_url": "", "campaigns": []}
+
+    def checkin_status(self):
+        return False, {"unavailable": True, "error": "nf"}
+
+    def pro_eligibility(self):
+        return False, "nf"
+
+    def fetch_credits(self):
+        return {"ok": True}
+
+    def fetch_plan(self):
+        return ""
+
+
+_a22 = _Acc22()
+T._fetch_upstream_parallel(_a22)
+T._fetch_upstream_parallel(_a22)
+check("面板短缓存：TTL 内第二次不再打上游",
+      _hits22["campaigns"] == 1, _hits22)
+T.invalidate_panel_cache()
+T._fetch_upstream_parallel(_a22)
+check("invalidate_panel_cache：失效后重新取",
+      _hits22["campaigns"] == 2, _hits22)
+T.invalidate_panel_cache()
+
+_p22 = A.AccountPool(os.path.join(os.environ["ACCOUNTS_DIR"], "unused22"))
+_cn22 = A.Account({"uid": "cn22", "realm": "cn", "accessToken": "dt-x"})
+_intl22 = A.Account({"uid": "intl22", "realm": "intl", "accessToken": "dt-y"})
+_p22.accounts = [_intl22, _cn22]
+_orig_ftv = T.fetch_task_view
+T.fetch_task_view = lambda acc: ([], {"campaigns": {}})
+try:
+    _v_cn = T.fetch_tasks_view(_p22, realm="cn")
+    _v_intl = T.fetch_tasks_view(_p22, realm="intl")
+    _v_all = T.fetch_tasks_view(_p22)
+finally:
+    T.fetch_task_view = _orig_ftv
+check("fetch_tasks_view(realm=cn) 只列国内版账号",
+      [a["realm"] for a in _v_cn["accounts"]] == ["cn"], _v_cn["accounts"])
+check("fetch_tasks_view(realm=intl) 只列国际版账号",
+      [a["realm"] for a in _v_intl["accounts"]] == ["intl"], _v_intl["accounts"])
+check("不传 realm 时保持原行为（全部账号）",
+      len(_v_all["accounts"]) == 2, _v_all["accounts"])
 
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))

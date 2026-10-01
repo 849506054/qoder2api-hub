@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1980,6 +1980,67 @@ def normalize_reasoning_effort(effort, meta):
 
     best = sorted(sup, key=key)[0]
     return best, "unsupported level %s -> %s" % (e, best)
+
+
+# ---------------------------------------------------------------------------
+# 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
+# ---------------------------------------------------------------------------
+UPDATE_CHECK_URL = ("https://api.github.com/repos/shuishuipingan/"
+                    "qoder2api-hub/releases/latest")
+UPDATE_CHECK_TTL = 6 * 3600
+_update_cache = {"at": 0.0, "data": None}
+
+
+def version_tuple(value):
+    """'v1.2.3' -> (1, 2, 3)；容忍前缀与不足位数。"""
+    out = []
+    for chunk in str(value or "").lstrip("vV").split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        out.append(int(digits or 0))
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
+def check_for_update(force=False):
+    """检查项目是否有新版本（对比当前 VERSION 与 GitHub 最新 release）。
+
+    返回 {ok, current, latest, has_update, url, published_at, name, checked_at, error}
+    网络不可用/被墙时 ok=False + error，看板据此显示"检查失败"而不是误报。
+    """
+    now = time.time()
+    cached = _update_cache.get("data")
+    if cached and not force and now - _update_cache.get("at", 0) < UPDATE_CHECK_TTL:
+        return cached
+    info = {"ok": False, "current": VERSION, "latest": "", "has_update": False,
+            "url": "", "published_at": "", "name": "", "checked_at": int(now),
+            "error": ""}
+    try:
+        url = validate_public_http_url(UPDATE_CHECK_URL)
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "qoder-proxy-update-check",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag = str(data.get("tag_name") or "").strip()
+        info.update({
+            "ok": True,
+            "latest": tag,
+            "url": str(data.get("html_url") or ""),
+            "published_at": str(data.get("published_at") or ""),
+            "name": str(data.get("name") or ""),
+            "has_update": bool(tag) and version_tuple(tag) > version_tuple(VERSION),
+        })
+    except Exception as exc:
+        info["error"] = str(exc)[:160]
+    _update_cache.update({"at": now, "data": info})
+    return info
 
 
 def is_deepseek_model(model="", model_key=""):
@@ -4133,6 +4194,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/diag"):
             return True
+        if path.startswith("/update"):
+            return True
         return False
 
     def do_OPTIONS(self):
@@ -4177,6 +4240,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             return self.wfile.write(body)
+        if path == "/update/check":
+            # 项目新版本检测（看板「运行信息 · 新版本检测」；结果缓存 6h，force=1 强制刷新）
+            _u = parse_qs(urlparse(self.path).query)
+            try:
+                return self._json(200, check_for_update(
+                    force=bool(_u.get("force", [None])[0])))
+            except Exception as exc:
+                return self._error(500, "update check failed: %s" % exc)
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
             # 以官方风控桥 runtime-info.exe 的 vmInfo 为准，桥不可用时本机交叉校验。
@@ -4318,7 +4389,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             import qoder_tasks
             uid = (query.get("uid") or [None])[0]
-            view = qoder_tasks.fetch_tasks_view(POOL, uid=uid)
+            # 账号池与积分按视图分区：?realm=cn|intl 时只列该区域账号
+            realm_q = (query.get("realm") or [None])[0]
+            if realm_q not in ("cn", "intl"):
+                realm_q = None
+            view = qoder_tasks.fetch_tasks_view(POOL, realm=realm_q, uid=uid)
             if view.get("msg") and not view.get("tasks"):
                 return self._json(200, view)
             return self._json(200, view)
@@ -4610,6 +4685,7 @@ class Handler(BaseHTTPRequestHandler):
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_checkin(targets, gap=1.0)
+            qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {
                 "ok": res["ok"],
                 "credit_added": res["credit_added"],
@@ -4634,6 +4710,7 @@ class Handler(BaseHTTPRequestHandler):
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_pro_claim(targets)
+            qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {
                 "ok": True,
                 "results": res["results"],
@@ -4662,6 +4739,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "current": CURRENT_REALM,
                                     "persisted": True})
         if path == "/accounts/checkin":
+            import qoder_tasks
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
             results = []
@@ -4674,6 +4752,7 @@ class Handler(BaseHTTPRequestHandler):
                 res = account.checkin()
                 results.append({"uid": account.uid,
                                 "nickname": account.nickname, **res})
+            qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {"results": results,
                                     "accounts": account_views()})
         if path == "/accounts/login/start":
