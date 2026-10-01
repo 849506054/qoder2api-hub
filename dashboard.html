@@ -411,8 +411,8 @@ a:hover{text-decoration:underline}
         <select id="growthAcctSelect" onchange="switchGrowthAccount(this.value)" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--fg);font-family:inherit">
           <option value="all">全部账号 (批量)</option>
         </select>
-        <button class="primary" id="btnRunTasks" onclick="runGrowthTasks(this)">一键签到领积分</button>
-        <button id="btnCatTravel" onclick="triggerCatTravel(this)">领取福利包</button>
+        <button class="primary" id="btnRunTasks" onclick="runGrowthTasks(this)">领取全部福利</button>
+        <button id="btnCatTravel" onclick="triggerCatTravel(this)">仅领 Pro 福利包</button>
       </div>
     </div>
 
@@ -1439,14 +1439,15 @@ function renderGrowthTasks(r){
     }).join('');
 }
 
+// 「领取全部福利」：每日签到/活动（含券类）+ Pro 福利包，一次点完（均幂等）
 async function runGrowthTasks(btn){
   btn.disabled = true;
   const oldText = btn.textContent;
-  btn.textContent = '任务执行中...';
+  btn.textContent = '领取中...';
   const logBox = document.getElementById("taskLogBox");
   if(logBox){
     logBox.style.display = 'block';
-    logBox.innerHTML = '<div style="color:var(--accent)">[checkin] 正在启动每日签到与领奖流水...</div>';
+    logBox.innerHTML = '<div style="color:var(--accent)">[福利] 正在领取全部福利（每日签到 + 限时活动 + Pro 福利包）...</div>';
   }
   try{
     const payload = {};
@@ -1454,14 +1455,21 @@ async function runGrowthTasks(btn){
       payload.uid = CURRENT_GROWTH_UID;
     }
     const r = await postJSON("/tasks/run", payload);
-    const logs = r.logs || [];
+    const logs = (r.logs || []).slice();
+    let proMsg = '';
+    try{
+      const t = await postJSON("/tasks/travel", payload);
+      if(t && t.msg) proMsg = t.msg;
+      logs.push('--- Pro 福利包 ---');
+      (t.logs || []).forEach(l => logs.push(l));
+    }catch(e2){ logs.push('Pro 福利包领取跳过: ' + (e2 && e2.message)); }
     if(logBox){
       logBox.innerHTML = logs.map(l => '<div>' + esc(l) + '</div>').join('');
       logBox.scrollTop = logBox.scrollHeight;
     }
     await Promise.all([loadAccounts(), loadGrowthTasks({force:true})]);
-    const sumC = r.credit_added != null ? ('，共增加 +' + r.credit_added + ' 积分') : '';
-    toast("签到流水执行完成" + sumC + "！");
+    const sumC = r.credit_added != null ? ('，活动新增 +' + r.credit_added + ' 积分') : '';
+    toast("全部福利领取完成" + sumC + (proMsg ? ('；Pro: ' + proMsg.slice(0, 60)) : '') + "！");
   }catch(e){
     if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">执行出错: ' + esc(e.message) + '</div>';
     alert("任务执行失败: " + e.message);

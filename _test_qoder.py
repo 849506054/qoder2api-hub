@@ -1464,13 +1464,23 @@ A.Account.checkin_status = _stub_status
 _A_CAMPAIGNS = {
     "intl": {"ok": True, "available": True, "show_campaign": True,
              "claimable": False, "campaign_url": "https://openapi.qoder.sh/growth-page/activity-iframe",
-             "campaigns": [{"campaign_id": "c-intl", "campaign_key": "act-intl",
-                            "action_type": "VIEW_DETAILS", "claim_status": "CLAIMED",
-                            "start_at": 0, "end_at": 0,
-                            "benefit": {"kind": "", "amount": 0},
-                            "required_achievement_key": "",
-                            "achievement_completed": False, "unavailable_reason": "",
-                            "placements": []}]},
+             "campaigns": [
+                 {"campaign_id": "c-intl", "campaign_key": "act-intl",
+                  "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMED",
+                  "title_zh": "每天领 100 Credits",
+                  "start_at": 0, "end_at": 0,
+                  "benefit": {"kind": "CREDITS", "amount": 100},
+                  "required_achievement_key": "",
+                  "achievement_completed": False, "unavailable_reason": "",
+                  "placements": []},
+                 # 详情类活动（无奖励）：不应被算作"签到奖励"
+                 {"campaign_id": "c-detail", "campaign_key": "act-detail",
+                  "action_type": "VIEW_DETAILS", "claim_status": "CLAIMED",
+                  "start_at": 0, "end_at": 0,
+                  "benefit": {"kind": "", "amount": 0},
+                  "required_achievement_key": "",
+                  "achievement_completed": False, "unavailable_reason": "",
+                  "placements": []}]},
     "cn": {"ok": True, "available": True, "show_campaign": True,
            "claimable": True, "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
            "campaigns": [{"campaign_id": "c-cn", "campaign_key": "act-daily-100",
@@ -1503,9 +1513,11 @@ check("task center lists BOTH realms",
       _view_all["accounts"])
 _intl_row = [t for t in _view_intl["tasks"] if t["task_code"] == "daily_checkin"][0]
 _cn_row = [t for t in _view_cn["tasks"] if t["task_code"] == "daily_checkin"][0]
-check("intl: claimed campaign renders as 今日已领取 (not an empty row)",
-      _intl_row["status"] == "claimed" and "今日已领取" in _intl_row["description"],
-      _intl_row)
+check("intl: claimed 每日 Credits renders as 今日已领取（中文活动名）",
+      _intl_row["status"] == "claimed" and "今日已领取" in _intl_row["description"]
+      and "每天领 100 Credits" in _intl_row["description"], _intl_row)
+check("每日行不计入详情类活动（VIEW_DETAILS 不算签到奖励）",
+      "act-detail" not in _intl_row["description"], _intl_row["description"])
 check("cn: CLAIMABLE campaign renders as 待领奖 + reward amount",
       _cn_row["status"] == "completed" and _cn_row["reward_credit"] == 100
       and "领取" in _cn_row["description"], _cn_row)
@@ -2336,6 +2348,93 @@ check("两条都算领取成功（没有被我方预判拦截）",
       _rx24["claimed"] and _ry24["claimed"]
       and not _rx24["blocked"] and not _ry24["blocked"],
       (_rx24.get("blocked"), _ry24.get("blocked")))
+
+print()
+print("[25] 活动中文名 / 每日签到只领积分 / 领取全部福利")
+# --- 25.1 中文名：官方标题优先，其次兜底表，最后 kind 兜底 ---
+check("campaign_title: 官方 content.zh.title 优先",
+      T.campaign_title({"title_zh": "发布 Qoder 站点，免费领取奶茶免单卡",
+                        "campaign_key": "act-x"}) == "发布 Qoder 站点，免费领取奶茶免单卡")
+check("campaign_title: 已知 key 走内置兜底",
+      T.campaign_title({"campaign_key": "act-20260928-620"})
+      == "新人任务：发布 Qoder 站点领奶茶免单卡", 
+      T.campaign_title({"campaign_key": "act-20260928-620"}))
+check("campaign_title: 前缀兜底（每日 100）",
+      T.campaign_title({"campaign_key": "act-20260930-999"}) == "每天领 100 Credits")
+check("campaign_title: 未知 key 按奖励类型兜底",
+      T.campaign_title({"campaign_key": "act-unknown-1",
+                        "benefit": {"kind": "REDEMPTION_CODE"}}) == "限时活动（兑换码）"
+      and T.campaign_title({"campaign_key": "act-unknown-2",
+                            "benefit": {"kind": "CREDITS"}}) == "限时活动（Credits）")
+
+# --- 25.2 账号面板「每日签到」只领积分：券类活动不被触碰 ---
+_orig_camp25 = A.Account.campaigns
+_orig_claim25 = A.Account.claim_campaign
+_orig_native25 = A.native_machine_identity
+_posts25 = []
+
+
+def _camp_mixed25(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": True,
+            "campaign_url": "", "identity": "runtime-info",
+            "campaigns": [
+                {"campaign_id": "c-daily", "campaign_key": "act-daily",
+                 "title_zh": "每天领 100 Credits",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "CREDITS", "amount": 100},
+                 "required_achievement_key": "", "achievement_completed": True,
+                 "unavailable_reason": "", "placements": []},
+                {"campaign_id": "c-cup", "campaign_key": "act-cup",
+                 "title_zh": "发布 Qoder 站点，免费领取奶茶免单卡",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                 "required_achievement_key": "", "achievement_completed": True,
+                 "unavailable_reason": "", "placements": []}]}
+
+
+def _claim_spy25(self, campaign_id):
+    _posts25.append(campaign_id)
+    return {"ok": True, "status": "CLAIMED", "replayed": False, "amount": 100,
+            "redemption_code": "CODE-1" if "cup" in campaign_id else "",
+            "message": "领取成功"}
+
+
+A.Account.campaigns = _camp_mixed25
+A.Account.claim_campaign = _claim_spy25
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+try:
+    _acc25 = A.Account({"uid": "daily25", "realm": "cn", "accessToken": "dt-x"})
+    _r_daily = _acc25.campaign_checkin(gap=0, only_kinds=("", "CREDITS"))
+    _posts25.clear()
+    _r_all = _acc25.campaign_checkin(gap=0)
+finally:
+    A.Account.campaigns = _orig_camp25
+    A.Account.claim_campaign = _orig_claim25
+    A.native_machine_identity = _orig_native25
+check("only_kinds=CREDITS：只领每日积分，不碰券类活动",
+      _r_daily["claimed"] and len(_r_daily["claimed"]) == 1
+      and _r_daily["claimed"][0]["campaign_key"] == "act-daily", _r_daily.get("claimed"))
+check("不带 only_kinds：积分与券类都领",
+      [c["campaign_key"] for c in _r_all["claimed"]] == ["act-daily", "act-cup"],
+      [c["campaign_key"] for c in _r_all["claimed"]])
+
+# --- 25.3 面板/接口接线：账号面板走 only_daily，福利中心走全量 ---
+_src25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("账号面板 /accounts/checkin 只做每日签到",
+      "run_checkin(account, gap=0.4, only_daily=True)" in _src25)
+check("签到与福利中心 /tasks/run 仍是全量领取",
+      "run_batch_checkin(targets, gap=1.0)" in _src25)
+_dash25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "dashboard.html"), encoding="utf-8").read()
+check("按钮文案：领取全部福利 / 仅领 Pro 福利包",
+      ">领取全部福利<" in _dash25 and ">仅领 Pro 福利包<" in _dash25
+      and "一键签到领积分" not in _dash25)
+check("领取全部福利 = 活动全量 + Pro 福利包（run + travel）",
+      'postJSON("/tasks/run"' in _dash25 and 'postJSON("/tasks/travel"' in _dash25)
 
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))

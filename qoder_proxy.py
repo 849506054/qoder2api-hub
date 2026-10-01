@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4739,6 +4739,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "current": CURRENT_REALM,
                                     "persisted": True})
         if path == "/accounts/checkin":
+            # 账号面板的「每日签到」按钮：**只做每日签到领积分**——Credits 类活动
+            # （如"每天领 100 Credits"，旧 sash 接口兜底），不领券/兑换码类活动，
+            # 也不领 Pro 福利包（那些走签到与福利中心的按钮）。
             import qoder_tasks
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
@@ -4748,10 +4751,16 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if not account.enabled or not account.access_token:
                     continue
-                # 能力运行时探测（不再"仅国内版"）：接口不存在时返回明确原因
-                res = account.checkin()
-                results.append({"uid": account.uid,
-                                "nickname": account.nickname, **res})
+                res = qoder_tasks.run_checkin(account, gap=0.4, only_daily=True)
+                results.append({
+                    "uid": account.uid,
+                    "nickname": account.nickname,
+                    "ok": bool(res.get("ok")),
+                    "earned_credit": res.get("earned_credit") or 0,
+                    "msg": (res.get("logs") or [""])[-1],
+                    "logs": res.get("logs") or [],
+                    "credits": res.get("credits"),
+                })
             qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {"results": results,
                                     "accounts": account_views()})
