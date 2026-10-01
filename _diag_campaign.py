@@ -44,6 +44,55 @@ RULES = """
 """
 
 
+import winreg
+
+
+def local_virtualization_report():
+    """本机虚拟化状态：官方 runtime-info 的 isVm 在"开了 VBS/内核隔离的实体机"
+    上会误报为 VM（Windows 自身跑在 Hyper-V 之上，CPU 暴露 hypervisor 位）。"""
+    out = {}
+    try:
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Control\DeviceGuard")
+        out["VBS(基于虚拟化的安全)"] = winreg.QueryValueEx(k,
+                                                "EnableVirtualizationBasedSecurity")[0]
+    except Exception:
+        out["VBS(基于虚拟化的安全)"] = "?"
+    try:
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Control\DeviceGuard"
+                           r"\Scenarios\HypervisorEnforcedCodeIntegrity")
+        out["HVCI(内核隔离/内存完整性)"] = winreg.QueryValueEx(k, "Enabled")[0]
+    except Exception:
+        out["HVCI(内核隔离/内存完整性)"] = "?"
+    try:
+        import subprocess
+        raw = subprocess.run(["systeminfo"], capture_output=True,
+                             timeout=90).stdout
+        t = ""
+        for enc in ("utf-8", "gbk"):
+            t = raw.decode(enc, "replace")
+            if ("虚拟机监控程序" in t or "hypervisor" in t.lower()
+                    or "系统制造商" in t or "System Manufacturer" in t):
+                break
+        out["检测到hypervisor"] = ("是" if ("虚拟机监控程序" in t or
+                                        "hypervisor has been detected" in t.lower())
+                                  else "否")
+    except Exception:
+        out["检测到hypervisor"] = "?"
+    try:
+        import subprocess
+        cs = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_ComputerSystem).Manufacturer + ' / ' + "
+             "(Get-CimInstance Win32_ComputerSystem).Model"],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        out["硬件(厂商/型号)"] = cs or "?"
+    except Exception:
+        out["硬件(厂商/型号)"] = "?"
+    return out
+
+
 def identity_report(realm, account_id):
     exe = A.runtime_info_exe(realm)
     if not exe:
@@ -57,7 +106,14 @@ def identity_report(realm, account_id):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--uid", default="", help="只体检 uid 前缀匹配的账号")
+    ap.add_argument("--no-local", action="store_true",
+                    help="跳过本机虚拟化状态检查")
     args = ap.parse_args()
+    if not args.no_local:
+        print("本机虚拟化状态（isVm 误报常见于开了 VBS/内核隔离的实体机）：")
+        for k, v in local_virtualization_report().items():
+            print("   %s = %s" % (k, v))
+        print()
     pool = A.AccountPool(os.environ["ACCOUNTS_DIR"], log=lambda m: None)
     pool.load()
     accs = [a for a in pool.accounts
