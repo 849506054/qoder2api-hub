@@ -2030,5 +2030,204 @@ check("不传 realm 时保持原行为（全部账号）",
       len(_v_all["accounts"]) == 2, _v_all["accounts"])
 
 print()
+print("[23] 兑换码/券类活动（奶茶免单卡 act-20260928-620）")
+# --- 23.1 领取响应：捕获 redemptionCode 并持久化 ---
+_orig_hj23 = A.http_json
+
+
+def _fake_claim_code(url, **kw):
+    return {"status": "CLAIMED", "replayed": False,
+            "grantId": "g-coffee", "redemptionCode": "MT-ABCD-1234",
+            "benefit": {"kind": "REDEMPTION_CODE", "amount": 1}}
+
+
+A.http_json = _fake_claim_code
+_acc23 = A.Account({"uid": "coffee23", "realm": "cn", "accessToken": "dt-x"})
+_res23 = _acc23.claim_campaign("c-coffee")
+A.http_json = _orig_hj23
+check("claim 响应捕获兑换码", _res23["ok"] and _res23["redemption_code"] == "MT-ABCD-1234",
+      _res23)
+check("兑换码写入账号（可持久化，重启不丢）",
+      _acc23.campaign_codes.get("c-coffee") == "MT-ABCD-1234"
+      and _acc23.to_dict().get("campaignCodes", {}).get("c-coffee") == "MT-ABCD-1234",
+      _acc23.campaign_codes)
+_acc23b = A.Account(_acc23.to_dict())
+check("新 Account 能读回兑换码",
+      _acc23b.campaign_codes.get("c-coffee") == "MT-ABCD-1234")
+check("领取成功消息带上兑换码", "兑换码" in _res23["message"], _res23["message"])
+
+# --- 23.2 CLAIMED 但无码 -> 发放确认中 ---
+def _fake_claim_nocode(url, **kw):
+    return {"status": "CLAIMED", "replayed": False, "grantId": "g2",
+            "benefit": {"kind": "REDEMPTION_CODE", "amount": 1}}
+
+
+A.http_json = _fake_claim_nocode
+_res23b = _acc23.claim_campaign("c-coffee2")
+check("CLAIMED 无兑换码 -> confirming 标记", _res23b.get("confirming") is True, _res23b)
+A.http_json = _orig_hj23
+
+# --- 23.3 失败码映射（名额发完 / 成就未完成）---
+def _fake_claim_oos(url, **kw):
+    return {"status": "NOT_ELIGIBLE", "failureCode": "REDEMPTION_CODE_OUT_OF_STOCK"}
+
+
+A.http_json = _fake_claim_oos
+_res23c = _acc23.claim_campaign("c-coffee")
+A.http_json = _orig_hj23
+check("名额发完 -> 失败码 + 中文说明",
+      not _res23c["ok"] and _res23c["failure_code"] == "REDEMPTION_CODE_OUT_OF_STOCK"
+      and "名额已发完" in _res23c["message"], _res23c)
+
+# --- 23.4 campaign_checkin 分类：pending / locked / codes ---
+_orig_camp23 = A.Account.campaigns
+_orig_native23 = A.native_machine_identity
+
+
+def _stub_campains23(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": False,
+            "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+            "identity": "runtime-info",
+            "campaigns": [
+                {"campaign_id": "c-daily", "campaign_key": "act-daily",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMED",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "CREDITS", "amount": 100},
+                 "required_achievement_key": "", "achievement_completed": True,
+                 "unavailable_reason": "", "placements": []},
+                {"campaign_id": "c-coffee", "campaign_key": "act-20260928-620",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "NOT_ELIGIBLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                 "required_achievement_key": "sites_first_use",
+                 "achievement_completed": True,
+                 "unavailable_reason": "REDEMPTION_CODE_OUT_OF_STOCK",
+                 "placements": []},
+                {"campaign_id": "c-task", "campaign_key": "act-locked",
+                 "action_type": "CLAIM_BENEFIT", "claim_status": "NOT_ELIGIBLE",
+                 "start_at": 0, "end_at": 0,
+                 "benefit": {"kind": "CREDITS", "amount": 50},
+                 "required_achievement_key": "goal_first_use",
+                 "achievement_completed": False,
+                 "unavailable_reason": "ACHIEVEMENT_NOT_COMPLETED",
+                 "placements": []}]}
+
+
+A.Account.campaigns = _stub_campains23
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+_acc23c = A.Account({"uid": "coffee23c", "realm": "cn", "accessToken": "dt-x"})
+try:
+    _res23d = _acc23c.campaign_checkin(gap=0)
+finally:
+    A.Account.campaigns = _orig_camp23
+    A.native_machine_identity = _orig_native23
+check("名额发完的活动进 pending（不是被当成无活动）",
+      [c["campaign_key"] for c in _res23d["pending"]] == ["act-20260928-620"],
+      _res23d.get("pending"))
+check("成就未完成的活动进 locked",
+      [c["campaign_key"] for c in _res23d["locked"]] == ["act-locked"],
+      _res23d.get("locked"))
+check("结论里带次日重试提示", "次日 10:00" in _res23d["message"], _res23d["message"])
+
+# --- 23.5 独立任务行（奶茶免单卡）+ 兑换码回显 ---
+_orig_camp23b = A.Account.campaigns
+A.Account.campaigns = _stub_campains23
+_acc23e = A.Account({"uid": "coffee23e", "realm": "cn", "accessToken": "dt-x"})
+_acc23e.campaign_codes = {"c-coffee": "MT-ZZZZ-9999"}
+try:
+    _rows23 = T._extra_campaign_rows(_acc23e, _acc23e.campaigns())
+finally:
+    A.Account.campaigns = _orig_camp23b
+_codes23 = [r["task_code"] for r in _rows23]
+check("券类活动单独成行（只含非 Credits 奖励）",
+      _codes23 == ["campaign:act-20260928-620"], _codes23)
+_crow = _rows23[0]
+check("行内含中文名额状态 + 奖励文本",
+      "名额已发完" in _crow["description"] and _crow["reward_text"] == "兑换码 ×1",
+      _crow)
+check("券类行不误报积分", _crow["reward_credit"] == 0, _crow["reward_credit"])
+
+
+def _stub_campains_claimed23(self, force=False):
+    out = _stub_campains23(self, force)
+    out["campaigns"][1]["claim_status"] = "CLAIMED"
+    out["campaigns"][1]["unavailable_reason"] = ""
+    return out
+
+
+A.Account.campaigns = _stub_campains_claimed23
+try:
+    _rows23b = T._extra_campaign_rows(_acc23e, _acc23e.campaigns())
+finally:
+    A.Account.campaigns = _orig_camp23b
+check("已领取的券类活动回显兑换码",
+      _rows23b[0]["status"] == "claimed"
+      and "MT-ZZZZ-9999" in _rows23b[0]["description"], _rows23b[0])
+
+# --- 23.6 多账号：同人已领 -> 冷却，不再重复 POST ---
+_orig_camp23c = A.Account.campaigns
+_orig_claim23 = A.Account.claim_campaign
+_orig_native23b = A.native_machine_identity
+_posts = []
+
+
+def _stub_camp_claimable23(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": True,
+            "campaign_url": "", "identity": "runtime-info",
+            "campaigns": [{"campaign_id": "c-cup", "campaign_key": "act-cup",
+                           "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                           "start_at": 0, "end_at": 0,
+                           "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                           "required_achievement_key": "", "achievement_completed": True,
+                           "unavailable_reason": "", "placements": []}]}
+
+
+def _stub_claim_blocked23(self, campaign_id):
+    _posts.append(campaign_id)
+    return {"ok": False, "blocked": True, "status": "BLOCKED",
+            "failure_code": "SAME_PERSON_ALREADY_CLAIMED",
+            "message": "同人已领取"}
+
+
+A.Account.campaigns = _stub_camp_claimable23
+A.Account.claim_campaign = _stub_claim_blocked23
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+_acc23f = A.Account({"uid": "multi23", "realm": "cn", "accessToken": "dt-x"})
+try:
+    _r1 = _acc23f.campaign_checkin(gap=0)
+    _r2 = _acc23f.campaign_checkin(gap=0)      # 冷却内：不应再 POST
+finally:
+    A.Account.campaigns = _orig_camp23c
+    A.Account.claim_campaign = _orig_claim23
+    A.native_machine_identity = _orig_native23b
+check("同人已领 -> 记录冷却并如实上报（不是失败）",
+      _r1["ok"] and _r1["blocked"] and _r1["blocked"][0]["failure_code"]
+      == "SAME_PERSON_ALREADY_CLAIMED", _r1.get("blocked"))
+check("冷却内的第二次不再重复 POST（多账号同机器不空转）",
+      _posts == ["c-cup"], _posts)
+check("冷却写入账号（可持久化）",
+      _acc23f.campaign_blocked_until.get("c-cup", 0) > time.time()
+      and _acc23f.campaign_blocked_until.get("c-cup", 0)
+      <= time.time() + 6 * 3600 + 5, _acc23f.campaign_blocked_until)
+
+# --- 23.7 summary.codes：按账号暴露已领兑换码 ---
+_orig_ftv23 = T._fetch_upstream_parallel
+T._fetch_upstream_parallel = lambda account, force=False: (
+    {"ok": True, "available": True, "show_campaign": True, "claimable": False,
+     "campaign_url": "", "identity": "runtime-info", "campaigns": []},
+    (False, {"error": "nf"}), (False, "nf"), {"ok": True}, "")
+_acc23g = A.Account({"uid": "codes23", "realm": "cn", "accessToken": "dt-x"})
+_acc23g.campaign_codes = {"c-cup": "MT-1111-2222"}
+try:
+    _t23g, _s23g = T.fetch_task_view(_acc23g)
+finally:
+    T._fetch_upstream_parallel = _orig_ftv23
+check("summary.codes 按账号给出兑换码",
+      _s23g.get("codes") == [{"campaign": "c-cup", "code": "MT-1111-2222"}],
+      _s23g.get("codes"))
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
