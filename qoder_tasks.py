@@ -164,6 +164,9 @@ def _campaign_task_row(account, camp, summary):
                  if c["claim_status"] == "CLAIMABLE"
                  and c["action_type"] in ("", "CLAIM_BENEFIT")]
     claimed = [c for c in items if c["claim_status"] == "CLAIMED"]
+    # 成就门控活动（如 CN 新人「奶茶免单卡」需先完成 sites_first_use）：
+    # 服务端状态 ACHIEVEMENT_NOT_COMPLETED —— 显示成就要求，不能直接领取
+    gated = [c for c in items if c["claim_status"] == "ACHIEVEMENT_NOT_COMPLETED"]
     if claimable:
         amount = sum(c["benefit_amount"] or 0 for c in claimable)
         keys = ", ".join(c["key"] for c in claimable)
@@ -192,6 +195,22 @@ def _campaign_task_row(account, camp, summary):
             "current": 1,
             "target": 1,
             "reward_credit": amount,
+            "reward_energy": 0,
+        }
+    if gated:
+        keys = ", ".join(c["key"] for c in gated)
+        reqs = ", ".join(c.get("required_achievement_key") or "?"
+                         for c in gated)
+        return {
+            "task_code": "daily_checkin",
+            "name": "每日签到（每日领取 Credits）",
+            "description": "有活动但需先完成成就：%s（活动 %s）——在官方桌面端"
+                           "完成对应任务后可领" % (reqs, keys),
+            "jump_url": jump,
+            "status": "not_accepted",
+            "current": 0,
+            "target": 1,
+            "reward_credit": sum(c["benefit_amount"] or 0 for c in gated),
             "reward_energy": 0,
         }
     desc = ("当前账号暂无可参与的官方活动（每日 100 为定向下发：常见原因——账号未在"
