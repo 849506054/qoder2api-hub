@@ -402,6 +402,114 @@ def _extra_campaign_rows(account, camp):
     return rows
 
 
+def _acct_name(a):
+    return (a.nickname or a.uid[:8]).strip()
+
+
+def _campaign_state_cn(status, reason, achievement_ok):
+    """把活动状态归一成中文分类（与官方前端状态机一致）。"""
+    st = str(status or "").upper()
+    rs = str(reason or "").upper()
+    if st == "CLAIMABLE":
+        return "claimable"
+    if st == "CLAIMED":
+        return "claimed"
+    if rs == "REDEMPTION_CODE_OUT_OF_STOCK":
+        return "out_of_stock"
+    if rs == "CAMPAIGN_NOT_ACTIVE":
+        return "inactive"
+    if rs == "RISK_BLOCKED":
+        return "risk_blocked"
+    if rs == "ACHIEVEMENT_NOT_COMPLETED" or achievement_ok is False:
+        return "task_required"
+    return "ineligible"
+
+
+def aggregate_campaign_rows(accounts, gap=0.0):
+    """uid=all：把全部账号的活动**按活动聚合成行**，并给出每账号资格明细。
+
+    现场反馈：只显示"某个账号"的活动会让人以为没资格的活动不存在；这里对每个
+    活动列出哪几个账号可领/已领/名额发完/需先完成任务/**无资格（不在定向内）**，
+    批量领取时仍然只对"服务端判定可领"的账号发起（逐个账号独立判断，只有上游
+    真的返回 SAME_PERSON_ALREADY_CLAIMED 才退避）。
+
+    返回 (rows, codes)：rows 为任务行；codes 为各账号已领取的兑换码明细。
+    """
+    merged = {}          # campaign_key -> {"c": 样例活动, "by": {状态: [账号名]}}
+    codes = []
+    total = len(accounts)
+    for acc in accounts:
+        try:
+            st = acc.campaigns()
+        except Exception:
+            st = {"ok": False}
+        for cid, code in (getattr(acc, "campaign_codes", {}) or {}).items():
+            if code:
+                codes.append({"account": acc.uid, "nickname": _acct_name(acc),
+                              "realm": acc.realm, "campaign_id": cid,
+                              "campaign": cid, "code": code,
+                              "url": (acc.campaign_status or {}).get("campaign_url") or ""})
+        if not st.get("ok"):
+            continue
+        for c in st.get("campaigns") or []:
+            key = c["campaign_key"] or c["campaign_id"]
+            slot = merged.setdefault(key, {"c": c, "by": {}})
+            state = _campaign_state_cn(c.get("claim_status"),
+                                       c.get("unavailable_reason"),
+                                       c.get("achievement_completed"))
+            slot["by"].setdefault(state, []).append(_acct_name(acc))
+    # 活动没出现在某账号列表里 = 该账号不在定向内（无资格）——如实标注
+    for key, slot in merged.items():
+        listed = [n for names in slot["by"].values() for n in names]
+        missing = [a for a in (_acct_name(x) for x in accounts) if a not in listed]
+        if missing:
+            slot["by"]["no_eligibility"] = missing
+
+    ORDER = ("claimable", "claimed", "out_of_stock", "task_required",
+             "risk_blocked", "inactive", "ineligible", "no_eligibility")
+    LABEL = {"claimable": "可领", "claimed": "已领", "out_of_stock": "名额发完",
+             "task_required": "需先完成任务", "risk_blocked": "风控拦截",
+             "inactive": "活动已结束", "ineligible": "暂不可领",
+             "no_eligibility": "无资格(不在定向)"}
+    rows = []
+    for key, slot in merged.items():
+        c = slot["c"]
+        by = slot["by"]
+        parts = ["%s %d/%d：%s" % (LABEL[k], len(by[k]), total, "、".join(by[k]))
+                 for k in ORDER if by.get(k)]
+        kind = str((c.get("benefit") or {}).get("kind") or "").upper()
+        amount = (c.get("benefit") or {}).get("amount") or 0
+        if kind in ("", "CREDITS"):
+            reward_text, reward_credit = "", amount
+        else:
+            label = {"REDEMPTION_CODE": "兑换码", "REDEMPTION_COUPON": "兑换券",
+                     "COUPON": "优惠券"}.get(kind, kind or "奖励")
+            reward_text, reward_credit = "%s ×%s" % (label, amount or 1), 0
+        if by.get("claimable"):
+            status = "completed"
+        elif by.get("claimed") and not by.get("claimable"):
+            status = "claimed"
+        else:
+            status = "not_accepted"
+        rows.append({
+            "task_code": "campaign:%s" % key,
+            "name": "限时活动 · %s" % key,
+            "description": "；".join(parts),
+            "jump_url": c.get("placements", [{}])[0].get("campaignUrl")
+                        if c.get("placements") else "",
+            "status": status,
+            "current": 1 if status in ("completed", "claimed") else 0,
+            "target": 1,
+            "reward_credit": reward_credit,
+            "reward_energy": 0,
+            "reward_text": reward_text,
+            "accounts_by_state": by,
+        })
+    rows.sort(key=lambda r: (r["status"] != "completed", r["status"] != "claimed",
+                             r["name"]))
+    return rows, codes
+
+
 def fetch_tasks_view(pool, realm=None, uid=None):
     """看板 /tasks 聚合：选定账号的任务行 + 全部可操作账号列表。
 
@@ -417,16 +525,33 @@ def fetch_tasks_view(pool, realm=None, uid=None):
     if not eligible:
         return {"tasks": [], "summary": {}, "accounts": [],
                 "msg": "未找到可用账号（账号已禁用、缺少凭证或不属于该区域）"}
+    acct_list = [{"uid": a.uid, "nickname": a.nickname or a.uid[:8],
+                  "realm": a.realm} for a in eligible]
+    if not uid or uid == "all":
+        # 全部账号：按"活动"聚合，逐个账号标注资格（可查看谁有资格/谁没有），
+        # 批量领取仍由 run_batch_checkin 逐账号判断（只对服务端判定可领的账号发起）
+        tasks, codes = aggregate_campaign_rows(eligible)
+        energy = 0
+        for a in eligible:
+            try:
+                energy += int(((a.credits or {}).get("remain")) or 0)
+            except Exception:
+                pass
+        summary = {"mode": "all", "realm": realm or "",
+                   "accounts_total": len(eligible), "energy": energy,
+                   "streak_days": 0, "travel": {"state": "unknown"},
+                   "plan": "全部账号", "codes": codes,
+                   "credits": {"remain": energy}}
+        return {"tasks": tasks, "summary": summary, "account": None,
+                "accounts": acct_list, "mode": "all"}
     acc = None
-    if uid and uid != "all":
+    if uid:
         target = pool.get(uid)
         if target and target in eligible:
             acc = target
     if acc is None:
         acc = eligible[0]
     tasks, summary = fetch_task_view(acc)
-    acct_list = [{"uid": a.uid, "nickname": a.nickname or a.uid[:8],
-                  "realm": a.realm} for a in eligible]
     return {"tasks": tasks, "summary": summary, "account": acc.public(),
             "accounts": acct_list}
 

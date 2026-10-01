@@ -417,8 +417,8 @@ a:hover{text-decoration:underline}
     </div>
 
     <div class="cards" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
-      <div class="card"><div class="val" id="stkDays">-</div><div class="lbl">连续签到天数</div></div>
-      <div class="card accent"><div class="val" id="nrgBalance">-</div><div class="lbl">积分额度余额</div></div>
+      <div class="card"><div class="val" id="stkDays">-</div><div class="lbl" id="stkLabel">连续签到天数</div></div>
+      <div class="card accent"><div class="val" id="nrgBalance">-</div><div class="lbl" id="nrgLabel">积分额度余额</div></div>
       <div class="card accent2"><div class="val" id="catState">-</div><div class="lbl" id="catDesc">Pro 福利包状态</div></div>
       <div class="card" id="cardVmState" title="官方客户端按设备风控身份下发活动；本机虚拟化环境会被计入风险画像">
         <div class="val" id="vmState" style="font-size:16px">-</div>
@@ -441,6 +441,22 @@ a:hover{text-decoration:underline}
         </thead>
         <tbody></tbody>
       </table>
+    </div>
+
+    <div id="codesPanel" style="display:none;margin-top:14px">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">🎟 已领取的兑换码 / 券（按账号）</div>
+      <div class="table-wrap"><table id="codesTable">
+        <thead><tr>
+          <th style="width:190px">账号</th>
+          <th style="width:190px">活动</th>
+          <th>兑换码</th>
+          <th style="width:170px">操作</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div style="font-size:11px;color:var(--dim);margin-top:6px">
+        兑换码仅保存在本机账号文件里；「活动页/二维码」打开官方活动页可用同一账号查看二维码。
+      </div>
     </div>
 
     <div id="taskLogBox" style="display:none;margin-top:14px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font-size:12px;font-family:ui-monospace,monospace;line-height:1.6;max-height:220px;overflow-y:auto"></div>
@@ -1299,6 +1315,46 @@ async function loadGrowthTasks(opts){
   }
 }
 
+// 兑换码/券面板：多账号时逐账号展示（账号 · 活动 · 兑换码 · 复制/活动页）
+function renderCodePanel(summary){
+  const box = document.getElementById('codesPanel');
+  const tb = document.querySelector('#codesTable tbody');
+  if(!box || !tb) return;
+  const codes = (summary && summary.codes) || [];
+  if(!codes.length){ box.style.display = 'none'; tb.innerHTML = ''; return; }
+  box.style.display = 'block';
+  tb.innerHTML = codes.map(c =>
+      '<tr><td>' + esc(c.nickname || '') +
+        '<br><span class="mono" style="font-size:11px;color:var(--dim)">' +
+        esc(String(c.account || '').slice(0, 8)) + ' · ' +
+        (c.realm === 'cn' ? '国内版' : '国际版') + '</span></td>' +
+      '<td class="mono" style="font-size:11px">' + esc(c.campaign || c.campaign_id || '') + '</td>' +
+      '<td><span class="mono" style="font-size:13px;letter-spacing:.5px">' + esc(c.code) + '</span></td>' +
+      '<td><button class="sec" style="font-size:11px;padding:3px 8px" data-copy="' + esc(c.code) + '">复制</button>' +
+        (c.url ? (' <a class="sec" style="font-size:11px;padding:3px 8px;display:inline-block" href="' +
+                  esc(c.url) + '" target="_blank" rel="noopener">活动页/二维码</a>') : '') +
+      '</td></tr>').join('');
+  tb.querySelectorAll('button[data-copy]').forEach(b => {
+    b.onclick = () => copyText(b.getAttribute('data-copy'), b);
+  });
+}
+
+function copyText(text, btn){
+  const done = () => { if(btn){ const t = btn.textContent; btn.textContent = '已复制';
+    setTimeout(() => { btn.textContent = t; }, 1500); } };
+  const fallback = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta); done();
+    } catch(e) { /* 复制失败：用户可手动选中 */ }
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(fallback);
+  } else { fallback(); }
+}
+
 function renderGrowthTasks(r){
     const tasks = r.tasks || [];
     const sum = r.summary || {};
@@ -1306,6 +1362,14 @@ function renderGrowthTasks(r){
     const streak = sum.streak_days || 0;
     const energy = sum.energy || 0;
     const tr = sum.travel || {};
+
+    // 全部账号（批量）视图：卡片改成合计口径，活动行已按活动聚合并标注每账号资格
+    const isAll = (sum.mode === 'all');
+    const lblStk = document.getElementById('stkLabel');
+    const lblNrg = document.getElementById('nrgLabel');
+    if(lblStk) lblStk.textContent = isAll ? '连续签到（批量视图）' : '连续签到天数';
+    if(lblNrg) lblNrg.textContent = isAll ? '合计积分余额（全部账号）' : '积分额度余额';
+    renderCodePanel(sum);
 
     const sel = document.getElementById("growthAcctSelect");
     if(sel && accts.length){
@@ -1338,6 +1402,8 @@ function renderGrowthTasks(r){
       }
     }
 
+    if(!isAll) renderCodePanel(sum);
+
     const tb = document.querySelector("#growthTable tbody");
     if(!tb) return;
     if(!tasks.length){
@@ -1355,7 +1421,9 @@ function renderGrowthTasks(r){
       } else if(t.status === 'not_accepted'){
         stBadge = '<span class="badge">未接取</span>';
       }
-      const prog = (t.status === 'claimed' || t.status === 'completed') ? '已达成' : (t.current + ' / ' + t.target);
+      const prog = t.accounts_by_state ? '多账号'
+                 : ((t.status === 'claimed' || t.status === 'completed') ? '已达成'
+                    : (t.current + ' / ' + t.target));
       // 券/兑换码类活动（如奶茶免单卡）用 reward_text 展示；积分/能量走原样式
       const rwd = t.reward_text
         ? ('<b style="color:var(--accent2)">' + esc(t.reward_text) + '</b>')

@@ -2229,5 +2229,114 @@ check("summary.codes 按账号给出兑换码",
       _s23g.get("codes"))
 
 print()
+print("[24] 全部账号视图：按活动聚合 + 每账号资格明细 + 多账号各自独立领取")
+# --- 24.1 聚合：能领的、名额发完的、无资格的三种账号同屏列出 ---
+_orig_camp24 = A.Account.campaigns
+_orig_native24 = A.native_machine_identity
+
+
+def _camp_for(uid):
+    base = {"ok": True, "available": True, "show_campaign": True,
+            "claimable": False, "campaign_url": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+            "identity": "runtime-info", "campaigns": []}
+    if uid == "a24":            # 有资格，可领
+        base["campaigns"] = [{"campaign_id": "c-cup", "campaign_key": "act-cup",
+                              "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                              "start_at": 0, "end_at": 0,
+                              "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                              "required_achievement_key": "", "achievement_completed": True,
+                              "unavailable_reason": "", "placements": []}]
+    elif uid == "b24":          # 有资格但名额发完
+        base["campaigns"] = [{"campaign_id": "c-cup", "campaign_key": "act-cup",
+                              "action_type": "CLAIM_BENEFIT", "claim_status": "NOT_ELIGIBLE",
+                              "start_at": 0, "end_at": 0,
+                              "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                              "required_achievement_key": "", "achievement_completed": True,
+                              "unavailable_reason": "REDEMPTION_CODE_OUT_OF_STOCK",
+                              "placements": []}]
+    return base                    # c24：列表里没有该活动 = 无资格
+
+
+A.Account.campaigns = lambda self, force=False: _camp_for(self.uid[:3])
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+_a24 = A.Account({"uid": "a24", "realm": "cn", "accessToken": "dt-x", "nickname": "可领号"})
+_b24 = A.Account({"uid": "b24", "realm": "cn", "accessToken": "dt-x", "nickname": "补货号"})
+_c24 = A.Account({"uid": "c24", "realm": "cn", "accessToken": "dt-x", "nickname": "无资格号"})
+_b24.campaign_codes = {"c-cup": "MT-FROM-B24"}
+try:
+    _rows24, _codes24 = T.aggregate_campaign_rows([_a24, _b24, _c24])
+finally:
+    A.Account.campaigns = _orig_camp24
+    A.native_machine_identity = _orig_native24
+check("聚合为每个活动一行（3 个账号只出 1 行活动）",
+      len(_rows24) == 1 and _rows24[0]["task_code"] == "campaign:act-cup", _rows24)
+_desc24 = _rows24[0]["description"]
+check("描述里逐账号标注：可领/名额发完/无资格",
+      "可领 1/3：可领号" in _desc24 and "名额发完 1/3：补货号" in _desc24
+      and "无资格(不在定向) 1/3：无资格号" in _desc24, _desc24)
+check("聚合行状态：有可领账号 -> 待领奖",
+      _rows24[0]["status"] == "completed" and _rows24[0]["reward_text"] == "兑换码 ×1",
+      _rows24[0])
+check("聚合结果按账号收集已领兑换码",
+      _codes24 and _codes24[0]["code"] == "MT-FROM-B24"
+      and _codes24[0]["nickname"] == "补货号"
+      and _codes24[0]["realm"] == "cn", _codes24)
+
+# --- 24.2 关键语义：上游没返回 SAME_PERSON_ALREADY_CLAIMED -> 各账号都能领 ---
+_orig_camp24b = A.Account.campaigns
+_orig_claim24 = A.Account.claim_campaign
+_orig_native24b = A.native_machine_identity
+_calls24 = []
+
+
+def _camp_claimable24(self, force=False):
+    return {"ok": True, "available": True, "show_campaign": True, "claimable": True,
+            "campaign_url": "", "identity": "runtime-info",
+            "campaigns": [{"campaign_id": "c-cup-" + self.uid,
+                           "campaign_key": "act-cup",
+                           "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+                           "start_at": 0, "end_at": 0,
+                           "benefit": {"kind": "REDEMPTION_CODE", "amount": 1},
+                           "required_achievement_key": "", "achievement_completed": True,
+                           "unavailable_reason": "", "placements": []}]}
+
+
+def _claim_http24(url, data=None, method=None, headers=None, timeout=None,
+                  retries=None, log=None):
+    # 只打桩 HTTP 层：让真实的 claim_campaign（含兑换码提取/落盘）跑起来
+    cid = url.rsplit("/", 2)[-2]
+    _calls24.append((headers.get("cosy-user", "?"), cid))
+    return {"status": "CLAIMED", "replayed": False, "grantId": "g-" + cid,
+            "redemptionCode": "CODE-" + cid.split("-")[-1],
+            "benefit": {"kind": "REDEMPTION_CODE", "amount": 1}}
+
+
+_orig_http24 = A.http_json
+A.Account.campaigns = _camp_claimable24
+A.http_json = _claim_http24
+A.native_machine_identity = lambda realm, uid, force=False: {
+    "machineToken": "t", "machineType": "ty", "machineCode": "c", "source": "runtime-info"}
+try:
+    _x24 = A.Account({"uid": "X24", "realm": "cn", "accessToken": "dt-x"})
+    _y24 = A.Account({"uid": "Y24", "realm": "cn", "accessToken": "dt-x"})
+    _rx24 = _x24.campaign_checkin(gap=0)
+    _ry24 = _y24.campaign_checkin(gap=0)
+finally:
+    A.Account.campaigns = _orig_camp24b
+    A.http_json = _orig_http24
+    A.native_machine_identity = _orig_native24b
+check("同机器两个账号：上游未判同人 -> 两个账号都发起领取",
+      [c[1] for c in _calls24] == ["c-cup-X24", "c-cup-Y24"], _calls24)
+check("各自拿到自己的兑换码（互不覆盖）",
+      _x24.campaign_codes.get("c-cup-X24") == "CODE-X24"
+      and _y24.campaign_codes.get("c-cup-Y24") == "CODE-Y24",
+      (_x24.campaign_codes, _y24.campaign_codes))
+check("两条都算领取成功（没有被我方预判拦截）",
+      _rx24["claimed"] and _ry24["claimed"]
+      and not _rx24["blocked"] and not _ry24["blocked"],
+      (_rx24.get("blocked"), _ry24.get("blocked")))
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
