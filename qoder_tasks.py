@@ -283,6 +283,10 @@ def run_checkin(account, gap=1.0):
                          for c in camp["claimed"])
         earned = int(camp.get("earned") or 0)
         logs.append(f"✓ [{name}] 活动领取成功 +{earned} Credits（{keys}）")
+    elif camp.get("blocked"):
+        codes = ", ".join(b.get("failure_code") or "?" for b in camp["blocked"])
+        logs.append(f"⚠ [{name}] 同人已领取：同一设备/身份下其他账号本轮已领"
+                    f"（服务端按人去重，{codes}），本号本轮不再发放")
     elif camp.get("already"):
         keys = ", ".join(c.get("campaign_key") or c.get("campaign_id")
                          for c in camp["already"])

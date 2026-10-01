@@ -1673,6 +1673,48 @@ check("replayed claim counted as already (no phantom credits)",
       _res21["earned"] == 0 and len(_res21["already"]) == 1
       and not _res21["claimed"], _res21.get("message"))
 
+# --- 20.3b 同人去重（实测 failureCode=SAME_PERSON_ALREADY_CLAIMED）：同机多号
+#     共享每轮一次的额度，被拦的号不算错误但也不能虚报积分 ---
+def _fake_blocked(url, **kw):
+    return {"grantId": "g-b", "status": "BLOCKED", "replayed": False,
+            "failureCode": "SAME_PERSON_ALREADY_CLAIMED",
+            "benefit": {"kind": "CREDITS", "amount": 100}}
+
+
+_orig_http20 = A.http_json
+A.http_json = _fake_blocked
+try:
+    _res_blk = _acc20.claim_campaign("cb")
+finally:
+    A.http_json = _orig_http20
+check("claim_campaign parses BLOCKED/SAME_PERSON as blocked (not ok)",
+      _res_blk["ok"] is False and _res_blk["blocked"] is True
+      and _res_blk["failure_code"] == "SAME_PERSON_ALREADY_CLAIMED", _res_blk)
+check("blocked claim keeps the benefit amount for reporting",
+      _res_blk["amount"] == 100, _res_blk.get("amount"))
+
+A.Account.campaigns = lambda self: {
+    "ok": True, "available": True, "show_campaign": True, "claimable": True,
+    "campaign_url": "", "campaigns": [
+        {"campaign_id": "cb", "campaign_key": "act-daily",
+         "action_type": "CLAIM_BENEFIT", "claim_status": "CLAIMABLE",
+         "start_at": 0, "end_at": 0, "benefit": {"kind": "CREDITS", "amount": 100},
+         "placements": []}]}
+A.Account.claim_campaign = lambda self, cid: {
+    "ok": False, "blocked": True, "status": "BLOCKED", "replayed": False,
+    "failure_code": "SAME_PERSON_ALREADY_CLAIMED", "amount": 100,
+    "message": "同人已领取（同一设备/身份下其他账号本轮已领，服务端按人去重）"}
+try:
+    _res22 = _acc20.campaign_checkin(gap=0)
+finally:
+    A.Account.claim_campaign = _orig_claim
+    A.Account.campaigns = _orig_camp
+check("BLOCKED claim is not counted as earned (person-level dedup)",
+      _res22["earned"] == 0 and not _res22["claimed"]
+      and len(_res22["blocked"]) == 1, _res22.get("message"))
+check("blocked message explains SAME_PERSON dedup",
+      "同人已领取" in _res22["message"], _res22["message"])
+
 # --- 20.5 身份轮换：show=false 时强制刷新身份并重试一次 ---
 _orig_get = A.Account._campaigns_get
 _orig_native = A.native_machine_identity

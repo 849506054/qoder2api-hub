@@ -965,8 +965,12 @@ class Account(object):
     def claim_campaign(self, campaign_id):
         """POST …/campaigns/{id}/claim -> 领取该活动奖励（官方幂等语义）。
 
-        返回 {ok, status, replayed, grant_id, amount, message}；
-        已领取时上游返回 status=CLAIMED + replayed=true（不会重复发放）。
+        返回 {ok, status, replayed, failure_code, grant_id, amount, message}。
+        服务端按"人"去重（同一机器指纹下的多账号合并为一人）：
+          - 已领取 -> status=CLAIMED + replayed=true（幂等，不重复发放）；
+          - 同人已领 -> status=BLOCKED + failureCode=SAME_PERSON_ALREADY_CLAIMED
+            （实测：同机多号共享每轮一次的额度，第二个号会被 BLOCKED 且列表里
+            隐藏该活动——官方文档写"每账号"，实际执行是"每人"）。
         """
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
@@ -989,13 +993,24 @@ class Account(object):
             return {"ok": False, "error": "HTTP %d %s" % (exc.code, body[:160])}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        status = str(r.get("status") or "")
+        status = str(r.get("status") or "").upper()
+        failure = str(r.get("failureCode") or "").upper()
+        if failure == "SAME_PERSON_ALREADY_CLAIMED" or status == "BLOCKED":
+            return {"ok": False, "blocked": True, "status": status or "BLOCKED",
+                    "replayed": False, "failure_code": failure or "BLOCKED",
+                    "amount": int(((r.get("benefit") or {})
+                                   if isinstance(r.get("benefit"), dict)
+                                   else {}).get("amount") or 0),
+                    "message": "同人已领取（同一设备/身份下其他账号本轮已领，"
+                               "服务端按人去重）",
+                    "raw": r}
         if not status and r.get("success") is False:
             return {"ok": False, "error": str(r.get("error") or r)[:160]}
         return {
-            "ok": status.upper() in ("CLAIMED", "GRANTED", "SUCCESS") or bool(r),
+            "ok": status in ("CLAIMED", "GRANTED", "SUCCESS"),
             "status": status,
             "replayed": bool(r.get("replayed")),
+            "failure_code": failure or "",
             "grant_id": str(r.get("grantId") or ""),
             "amount": int(((r.get("benefit") or {}) if isinstance(r.get("benefit"), dict)
                            else {}).get("amount") or r.get("amount") or 0),
@@ -1017,8 +1032,8 @@ class Account(object):
         st = self.campaigns()
         if not st.get("ok"):
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
-                    "earned": 0, "claimed": [], "already": []}
-        claimed, already, earned, errors = [], [], 0, []
+                    "earned": 0, "claimed": [], "already": [], "blocked": []}
+        claimed, already, earned, errors, blocked = [], [], 0, [], []
         for c in st["campaigns"]:
             if c["claim_status"] == "CLAIMED":
                 already.append(c)
@@ -1037,6 +1052,10 @@ class Account(object):
                     claimed.append(c)
                     earned += int(amount or 0)
                 time.sleep(max(0.0, gap))
+            elif res.get("blocked"):
+                # 服务端按"人"去重：同机器/同身份下其他账号本轮已领
+                blocked.append({"campaign": c["campaign_key"] or c["campaign_id"],
+                                "failure_code": res.get("failure_code")})
             else:
                 errors.append("%s: %s" % (c["campaign_key"] or c["campaign_id"],
                                           res.get("error")))
@@ -1044,6 +1063,9 @@ class Account(object):
             msg = "活动领取成功 +%d Credits（%s）" % (
                 earned, ", ".join(c["campaign_key"] or c["campaign_id"]
                                   for c in claimed))
+        elif blocked:
+            msg = ("同人已领取：同一设备/身份下的其他账号本轮已领过（服务端按人去重，"
+                   "failureCode=%s）" % blocked[0].get("failure_code"))
         elif already:
             msg = "今日活动奖励已领取（%s）" % ", ".join(
                 c["campaign_key"] or c["campaign_id"] for c in already)
@@ -1052,8 +1074,8 @@ class Account(object):
         else:
             msg = "当前账号暂无可领取的官方活动"
         return {"ok": not errors, "claimed": claimed, "already": already,
-                "earned": earned, "message": msg, "campaigns": st["campaigns"],
-                "errors": errors}
+                "blocked": blocked, "earned": earned, "message": msg,
+                "campaigns": st["campaigns"], "errors": errors}
 
 
     def _stamp_checkin(self):
